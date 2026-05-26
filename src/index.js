@@ -16,6 +16,7 @@ const DATA_DIR = path.join(ROOT, 'data');
 const CONVERSATION_DIR = path.join(DATA_DIR, 'conversations');
 const ACCESS_FILE = path.join(DATA_DIR, 'access.json');
 const WORKSPACE_FILE = path.join(DATA_DIR, 'workspaces.json');
+const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const APPROVED_DIR = path.join(DATA_DIR, 'approved');
 fs.mkdirSync(LOG_DIR, { recursive: true });
 fs.mkdirSync(CONVERSATION_DIR, { recursive: true });
@@ -42,6 +43,7 @@ const config = {
   memoryMaxTurns: Number(process.env.FEISHU_MEMORY_MAX_TURNS || 200),
   memoryContextTurns: Number(process.env.FEISHU_MEMORY_CONTEXT_TURNS || 3),
   memoryMaxChars: Number(process.env.FEISHU_MEMORY_MAX_CHARS || 240000),
+  codexSessionsEnabled: process.env.FEISHU_CODEX_SESSIONS_ENABLED !== '0',
   streamOutput: process.env.FEISHU_STREAM_OUTPUT === '1',
 };
 
@@ -164,11 +166,12 @@ async function handleIncomingMessage(data) {
   }
   if (command.kind === 'reset') {
     resetConversation(chatId);
+    clearChatSession(chatId);
     await sendUiMessage(chatId, {
       kind: 'success',
-      title: '上下文已清空',
+      title: '新会话已开始',
       template: 'green',
-      summary: '当前飞书会话的上下文记忆已重置。',
+      summary: '当前飞书会话的 Codex session 和上下文记忆已重置。',
     }, messageId);
     return;
   }
@@ -191,6 +194,7 @@ async function handleIncomingMessage(data) {
       senderId,
       useMemory: command.useMemory,
       memoryReason: command.memoryReason,
+      resetSession: command.resetSession,
     });
   }
 }
@@ -216,6 +220,10 @@ function parseCommand(rawText) {
   if (exactCommand && ['new', 'reset', 'clear', 'forget', '清空上下文', '清空记忆', '忘记'].includes(commandLower)) {
     return { kind: 'reset' };
   }
+  if (commandWithArgsAllowed && ['new', 'reset', 'clear', 'forget'].includes(commandLower)) {
+    const prompt = commandArgs.join(' ').trim();
+    if (prompt) return { kind: 'run', prompt, useMemory: false, resetSession: true, memoryReason: 'slash-new' };
+  }
   if (exactCommand && ['stop', '停止', '中止'].includes(commandLower)) {
     return { kind: 'stop' };
   }
@@ -230,6 +238,7 @@ function parseCommand(rawText) {
     kind: 'run',
     prompt: memoryHint.prompt,
     useMemory: memoryHint.useMemory,
+    resetSession: memoryHint.resetSession,
     memoryReason: memoryHint.reason,
   };
 }
@@ -239,17 +248,18 @@ function memoryHintForPrompt(prompt) {
   if (!text) return { prompt: text, useMemory: false, reason: 'empty' };
 
   const forceNew = text.match(/^(新任务|新的任务|开始新任务|另起一个任务|不要带上下文|不带上下文|忽略上文|忘记上文)[:：\s]+(.+)$/s);
-  if (forceNew) return { prompt: forceNew[2].trim(), useMemory: false, reason: 'force-new' };
+  if (forceNew) return { prompt: forceNew[2].trim(), useMemory: false, resetSession: true, reason: 'force-new' };
 
   const forceContinue = text.match(/^(继续|接着|基于上文|基于以上|根据上文|根据以上|参考上文|参考以上|延续上文|延续以上)[:：\s]*(.*)$/s);
   if (forceContinue) {
     const cleaned = forceContinue[2].trim();
-    return { prompt: cleaned || text, useMemory: true, reason: forceContinue[1] };
+    return { prompt: cleaned || text, useMemory: true, resetSession: false, reason: forceContinue[1] };
   }
 
   return {
     prompt: text,
     useMemory: config.memoryMode === 'always',
+    resetSession: false,
     reason: config.memoryMode === 'always' ? 'always' : 'new-task-default',
   };
 }
@@ -300,13 +310,14 @@ async function handleCd(chatId, target, replyToMessageId) {
 
   await cancelChatTasks(chatId, replyToMessageId, { quietWhenEmpty: true });
   setChatCwd(chatId, resolved.path);
+  clearChatSession(chatId);
   resetConversation(chatId);
   await sendUiMessage(chatId, {
     kind: 'success',
     title: '工作目录已切换',
     template: 'green',
     summary: `**当前目录**：${resolved.path}`,
-    body: '已同时清空当前飞书会话的上下文，避免新项目串到旧任务。',
+    body: '已同时清空当前飞书会话的 Codex session 和上下文，避免新项目串到旧任务。',
   }, replyToMessageId);
 }
 
@@ -458,19 +469,32 @@ async function startCodexTask(prompt, source) {
   const taskId = `codex-${Date.now()}-${++taskSeq}`;
   const startedAt = Date.now();
   const outputFile = path.join(DATA_DIR, `${taskId}.last-message.txt`);
-  const codexPrompt = buildPromptWithMemory(source.chatId, prompt, source.useMemory);
+  if (source.resetSession) clearChatSession(source.chatId);
+  const existingSession = config.codexSessionsEnabled ? sessionForChat(source.chatId) : '';
+  const shouldResume = Boolean(existingSession && !source.resetSession);
+  const codexPrompt = shouldResume ? prompt : buildPromptWithMemory(source.chatId, prompt, source.useMemory);
   const cwd = cwdForChat(source.chatId);
-  const args = ['exec', ...config.codexExtraArgs];
+  const args = shouldResume
+    ? ['exec', 'resume', ...config.codexExtraArgs]
+    : ['exec', ...config.codexExtraArgs];
+  if (!args.includes('--json')) args.push('--json');
   if (config.codexModel) args.push('-m', config.codexModel);
-  args.push('-o', outputFile, '-C', cwd, codexPrompt);
+  args.push('-o', outputFile);
+  if (shouldResume) {
+    args.push(existingSession, codexPrompt);
+  } else {
+    args.push('-C', cwd, codexPrompt);
+  }
 
   await sendTaskStarted(source.chatId, {
     taskId,
     cwd,
+    sessionId: shouldResume ? existingSession : '',
+    isResume: shouldResume,
     useMemory: source.useMemory,
     memoryReason: source.memoryReason,
   }, source.messageId);
-  log(`task ${taskId} start from=${source.senderId || 'unknown'} chat=${source.chatId} cwd=${cwd} memory=${source.useMemory ? source.memoryReason : 'new'} prompt=${singleLine(prompt).slice(0, 500)}`);
+  log(`task ${taskId} start from=${source.senderId || 'unknown'} chat=${source.chatId} cwd=${cwd} session=${shouldResume ? existingSession : 'new'} memory=${source.useMemory ? source.memoryReason : 'new'} prompt=${singleLine(prompt).slice(0, 500)}`);
 
   const child = spawn(config.codexBin, args, {
     cwd,
@@ -493,6 +517,9 @@ async function startCodexTask(prompt, source) {
     userPrompt: prompt,
     outputFile,
     cwd,
+    sessionId: shouldResume ? existingSession : '',
+    jsonOutput: true,
+    jsonRemainder: '',
     timer: null,
     killedByUser: false,
   };
@@ -523,12 +550,16 @@ async function startCodexTask(prompt, source) {
   child.on('close', async (code, signal) => {
     clearTimeout(timeout);
     running.delete(taskId);
+    if (task.jsonOutput && task.jsonRemainder) appendCodexJsonOutput(task, '\n');
     await flushTaskBuffer(task);
     const elapsed = Math.round((Date.now() - startedAt) / 1000);
     const tail = compactTail(task.output || task.stderr, 3000);
     const verdict = code === 0 && !signal ? '完成' : (task.killedByUser ? '已取消/超时' : '失败');
     const finalMessage = readFinalMessage(task);
     if (code === 0 && !signal && finalMessage) {
+      if (config.codexSessionsEnabled && task.sessionId) {
+        setChatSession(source.chatId, task.sessionId, cwd, taskId);
+      }
       appendConversationTurn(source.chatId, task.userPrompt, finalMessage);
     }
     await sendTaskFinished(source.chatId, {
@@ -545,9 +576,59 @@ async function startCodexTask(prompt, source) {
 }
 
 function appendOutput(task, text, isStderr) {
+  if (!isStderr && task.jsonOutput) {
+    appendCodexJsonOutput(task, text);
+    return;
+  }
   if (isStderr) task.stderr += text;
   else task.output += text;
 
+  task.buffer += text;
+  if (task.buffer.length > 3500) {
+    void flushTaskBuffer(task);
+    return;
+  }
+  if (!task.timer) {
+    task.timer = setTimeout(() => {
+      task.timer = null;
+      void flushTaskBuffer(task);
+    }, 5000);
+    task.timer.unref();
+  }
+}
+
+function appendCodexJsonOutput(task, text) {
+  task.jsonRemainder = `${task.jsonRemainder || ''}${text}`;
+  const lines = task.jsonRemainder.split(/\r?\n/);
+  task.jsonRemainder = lines.pop() || '';
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      task.output += `${line}\n`;
+      continue;
+    }
+
+    if (event.type === 'thread.started' && event.thread_id) {
+      task.sessionId = event.thread_id;
+      appendOutputText(task, `Codex session: ${event.thread_id}\n`);
+      continue;
+    }
+    if (event.type === 'item.completed' && event.item && event.item.type === 'agent_message') {
+      appendOutputText(task, `${event.item.text || ''}\n`);
+      continue;
+    }
+    if (event.type === 'turn.completed') {
+      appendOutputText(task, 'Codex turn completed.\n');
+    }
+  }
+}
+
+function appendOutputText(task, text) {
+  task.output += text;
   task.buffer += text;
   if (task.buffer.length > 3500) {
     void flushTaskBuffer(task);
@@ -656,7 +737,8 @@ async function sendTaskStarted(chatId, task, replyToMessageId) {
   const details = [
     `**任务 ID**：${task.taskId}`,
     `**工作目录**：${task.cwd}`,
-    `**上下文**：${task.useMemory ? `继续模式（${task.memoryReason || 'explicit'}）` : '新任务隔离'}`,
+    `**Codex session**：${task.isResume ? `继续 ${task.sessionId}` : '新建'}`,
+    `**上下文**：${task.isResume ? '使用 Codex 原生会话' : (task.useMemory ? `继续模式（${task.memoryReason || 'explicit'}）` : '新任务隔离')}`,
   ].join('\n');
   await sendCard(chatId, {
     header: {
@@ -722,6 +804,7 @@ async function sendStatus(chatId, replyToMessageId) {
     }
   }
   fields.push(`**当前会话工作目录**：${cwdForChat(chatId)}`);
+  fields.push(`**当前会话 Codex session**：${sessionForChat(chatId) || '未创建'}`);
   fields.push(`**默认工作目录**：${config.codexCwd}`);
   fields.push(`**上下文记忆**：${memoryStatusText()}`);
   await sendCard(chatId, {
@@ -750,8 +833,8 @@ async function sendHelp(chatId, replyToMessageId) {
     },
     elements: cardElements([
       { tag: 'markdown', content: commands.join('\n') },
-      { tag: 'markdown', content: `**当前会话工作目录**：${cwdForChat(chatId)}\n${conversationStatusText()}` },
-      { tag: 'markdown', content: `**上下文用法**\n默认每条消息都是新任务，不带旧上下文。\n需要继续旧任务时，以 \`继续\`、\`接着\`、\`基于上文\` 开头。\n强制新任务可用 \`新任务：...\`。` },
+      { tag: 'markdown', content: `**当前会话工作目录**：${cwdForChat(chatId)}\n**Codex session**：${sessionForChat(chatId) || '未创建'}` },
+      { tag: 'markdown', content: `**会话用法**\n每个飞书会话会保留自己的 Codex session，下一条消息默认接着聊。\n需要彻底开新任务时用 \`/new\`。切换目录 \`/cd\` 也会开启新 session。` },
     ]),
   }, helpText(chatId), replyToMessageId);
 }
@@ -830,19 +913,21 @@ function stripMention(text) {
 }
 
 function statusText(chatId) {
-  if (!running.size) return `当前没有运行中的 Codex 任务。桥接服务在线。\n当前会话工作目录：${cwdForChat(chatId)}\n${conversationStatusText()}`;
+  if (!running.size) return `当前没有运行中的 Codex 任务。桥接服务在线。\n当前会话工作目录：${cwdForChat(chatId)}\n当前会话 Codex session：${sessionForChat(chatId) || '未创建'}\n${conversationStatusText()}`;
   const lines = ['运行中的任务：'];
   for (const task of running.values()) {
     lines.push(`- ${task.id}，已运行 ${Math.round((Date.now() - task.startedAt) / 1000)}s`);
   }
   lines.push(`当前会话工作目录：${cwdForChat(chatId)}`);
+  lines.push(`当前会话 Codex session：${sessionForChat(chatId) || '未创建'}`);
   lines.push(conversationStatusText());
   return lines.join('\n');
 }
 
 function conversationStatusText() {
-  if (!config.memoryEnabled) return '上下文记忆：关闭';
-  return `上下文记忆：${memoryStatusText()}`;
+  const codexSession = config.codexSessionsEnabled ? 'Codex session：开启' : 'Codex session：关闭';
+  if (!config.memoryEnabled) return `${codexSession}\n上下文记忆：关闭`;
+  return `${codexSession}\n上下文记忆：${memoryStatusText()}`;
 }
 
 function memoryStatusText() {
@@ -865,6 +950,7 @@ function helpText(chatId) {
     '切换目录：/cd <目录>',
     '',
     `当前会话工作目录：${cwdForChat(chatId)}`,
+    `当前会话 Codex session：${sessionForChat(chatId) || '未创建'}`,
     conversationStatusText(),
   ].join('\n');
 }
@@ -1046,6 +1132,52 @@ function saveWorkspaces(workspaces) {
     fs.renameSync(tmp, WORKSPACE_FILE);
   } catch (err) {
     log(`workspace save failed: ${err.stack || err.message || err}`);
+  }
+}
+
+function sessionForChat(chatId) {
+  if (!config.codexSessionsEnabled) return '';
+  const sessions = loadSessions();
+  const session = sessions.chats && sessions.chats[chatId];
+  return session && session.sessionId ? session.sessionId : '';
+}
+
+function setChatSession(chatId, sessionId, cwd, taskId) {
+  const sessions = loadSessions();
+  sessions.chats = sessions.chats && typeof sessions.chats === 'object' ? sessions.chats : {};
+  sessions.chats[chatId] = {
+    sessionId,
+    cwd,
+    taskId,
+    updatedAt: new Date().toISOString(),
+  };
+  saveSessions(sessions);
+}
+
+function clearChatSession(chatId) {
+  const sessions = loadSessions();
+  if (!sessions.chats || !sessions.chats[chatId]) return;
+  delete sessions.chats[chatId];
+  saveSessions(sessions);
+}
+
+function loadSessions() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+    return parsed && typeof parsed === 'object' ? { chats: parsed.chats || {} } : { chats: {} };
+  } catch {
+    return { chats: {} };
+  }
+}
+
+function saveSessions(sessions) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+    const tmp = `${SESSIONS_FILE}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(sessions, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(tmp, SESSIONS_FILE);
+  } catch (err) {
+    log(`session save failed: ${err.stack || err.message || err}`);
   }
 }
 
