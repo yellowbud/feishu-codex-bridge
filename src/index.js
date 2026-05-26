@@ -50,6 +50,8 @@ const config = {
   newChatGroupMessageType: process.env.FEISHU_NEW_CHAT_GROUP_MESSAGE_TYPE || 'thread',
   outboundMediaEnabled: process.env.FEISHU_OUTBOUND_MEDIA_ENABLED !== '0',
   outboundMediaDirs: splitList(process.env.FEISHU_OUTBOUND_MEDIA_DIRS),
+  feishuDocFolderToken: process.env.FEISHU_DOC_FOLDER_TOKEN || '',
+  feishuDocBaseUrl: process.env.FEISHU_DOC_BASE_URL || 'https://www.feishu.cn/docx',
 };
 
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
@@ -1148,8 +1150,9 @@ async function sendTaskFinished(chatId, task, replyToMessageId) {
   const template = success ? 'green' : (cancelled ? 'orange' : 'red');
   const resultText = task.finalMessage || task.tail || '无输出。';
   const media = success ? collectOutboundMedia(resultText, task.cwd) : [];
-  const rich = success ? extractRichOutputs(resultText) : { text: resultText, tables: [], cards: [], actions: [] };
-  const displayText = rich.text || (rich.tables.length || rich.cards.length || rich.actions.length || media.length ? '已生成富文本/多媒体内容。' : resultText);
+  const rich = success ? extractRichOutputs(resultText) : { text: resultText, tables: [], cards: [], actions: [], docs: [] };
+  const richCount = rich.tables.length + rich.cards.length + rich.actions.length + rich.docs.length;
+  const displayText = rich.text || (richCount || media.length ? '已生成富文本/多媒体内容。' : resultText);
   const title = `Codex 任务${task.verdict}`;
   const meta = [
     `**任务 ID**：${task.taskId}`,
@@ -1184,6 +1187,9 @@ async function sendTaskFinished(chatId, task, replyToMessageId) {
       contextId: task.contextId,
       contextLabel: task.workspaceName || 'current',
     });
+  }
+  for (const doc of rich.docs) {
+    await sendFeishuDocCard(chatId, doc, replyToMessageId);
   }
   if (media.length) {
     await sendOutboundMedia(chatId, media, replyToMessageId);
@@ -1259,6 +1265,160 @@ async function sendActionCard(chatId, actionCard, options) {
     ]),
   };
   await sendCard(chatId, card, `${actionCard.title || '选择下一步'}\n${actions.map((action) => `- ${action.label}: ${action.prompt || action.value || ''}`).join('\n')}`, options.replyToMessageId);
+}
+
+async function sendFeishuDocCard(chatId, doc, replyToMessageId) {
+  try {
+    const created = await createFeishuDoc(doc);
+    await sendCard(chatId, {
+      config: { wide_screen_mode: true },
+      header: {
+        template: 'purple',
+        title: { tag: 'plain_text', content: '飞书文档已创建' },
+      },
+      elements: cardElements([
+        { tag: 'markdown', content: `**${escapeMarkdownLine(created.title)}**\n\n可以直接在飞书文档里阅读、评论和反馈。` },
+        {
+          tag: 'action',
+          actions: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '打开文档' },
+            type: 'primary',
+            url: created.url,
+          }],
+        },
+      ]),
+    }, `${created.title}\n${created.url}`, replyToMessageId);
+  } catch (err) {
+    log(`create feishu doc failed: ${err.stack || err.message || err}`);
+    await sendCard(chatId, {
+      header: {
+        template: 'orange',
+        title: { tag: 'plain_text', content: '飞书文档创建失败' },
+      },
+      elements: cardElements([
+        { tag: 'markdown', content: `已保留正文，下面以消息形式发送。\n\n${compactMiddle(doc.content, 3000)}` },
+      ]),
+    }, `${doc.title || '飞书文档创建失败'}\n${doc.content}`, replyToMessageId);
+  }
+}
+
+async function createFeishuDoc(doc) {
+  const documentApi = client.docx && (client.docx.document || (client.docx.v1 && client.docx.v1.document));
+  const childrenApi = client.docx && (client.docx.documentBlockChildren || (client.docx.v1 && client.docx.v1.documentBlockChildren));
+  if (!documentApi || !childrenApi) throw new Error('Feishu docx API is unavailable in current SDK client');
+
+  const title = safeDocTitle(doc.title || firstMarkdownHeading(doc.content) || 'Codex 文档');
+  const createPayload = { data: { title } };
+  if (config.feishuDocFolderToken) createPayload.data.folder_token = config.feishuDocFolderToken;
+  const created = await documentApi.create(createPayload);
+  const documentId = created && created.data && created.data.document && created.data.document.document_id;
+  if (!documentId) throw new Error(`create document returned no document_id: ${JSON.stringify(created).slice(0, 500)}`);
+
+  const blocks = await markdownToFeishuBlocks(doc.content, documentApi);
+  if (blocks.length) {
+    await childrenApi.create({
+      path: { document_id: documentId, block_id: documentId },
+      data: {
+        children: blocks.slice(0, 200),
+        client_token: randomBytes(8).toString('hex'),
+      },
+    });
+  }
+
+  return {
+    title,
+    documentId,
+    url: `${config.feishuDocBaseUrl.replace(/\/$/, '')}/${documentId}`,
+  };
+}
+
+async function markdownToFeishuBlocks(markdown, documentApi) {
+  const content = String(markdown || '').trim();
+  if (!content) return [];
+  if (typeof documentApi.convert === 'function') {
+    try {
+      const converted = await documentApi.convert({
+        data: { content_type: 'markdown', content: compactMiddle(content, 120000) },
+      });
+      const blocks = converted && converted.data && Array.isArray(converted.data.blocks) ? converted.data.blocks : [];
+      const firstLevelIds = converted && converted.data && Array.isArray(converted.data.first_level_block_ids)
+        ? converted.data.first_level_block_ids
+        : [];
+      const ordered = flattenConvertedBlocks(blocks, firstLevelIds).map(sanitizeDocBlock).filter(Boolean);
+      if (ordered.length) return ordered;
+    } catch (err) {
+      log(`convert markdown to feishu doc blocks failed, fallback to plain blocks: ${err.stack || err.message || err}`);
+    }
+  }
+  return fallbackMarkdownBlocks(content);
+}
+
+function flattenConvertedBlocks(blocks, firstLevelIds) {
+  if (!firstLevelIds.length) return blocks;
+  const byId = new Map(blocks.map((block) => [block.block_id, block]));
+  const result = [];
+  const visit = (id) => {
+    const block = byId.get(id);
+    if (!block) return;
+    result.push(block);
+    for (const childId of block.children || []) visit(childId);
+  };
+  for (const id of firstLevelIds) visit(id);
+  return result;
+}
+
+function sanitizeDocBlock(block) {
+  if (!block || typeof block !== 'object' || !block.block_type) return null;
+  const clone = { ...block };
+  delete clone.block_id;
+  delete clone.parent_id;
+  delete clone.children;
+  return clone;
+}
+
+function fallbackMarkdownBlocks(markdown) {
+  const lines = markdown.split(/\r?\n/);
+  const blocks = [];
+  let paragraph = [];
+  const flush = () => {
+    const content = paragraph.join('\n').trim();
+    paragraph = [];
+    if (content) blocks.push(docTextBlock(content));
+  };
+  for (const line of lines) {
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      flush();
+      blocks.push(docTextBlock(heading[2].trim(), heading[1].length + 2));
+    } else if (!line.trim()) {
+      flush();
+    } else {
+      paragraph.push(line);
+    }
+    if (blocks.length >= 200) break;
+  }
+  flush();
+  return blocks.length ? blocks : [docTextBlock(markdown)];
+}
+
+function docTextBlock(content, blockType = 2) {
+  const field = blockType === 3 ? 'heading1' : (blockType === 4 ? 'heading2' : (blockType === 5 ? 'heading3' : 'text'));
+  return {
+    block_type: blockType,
+    [field]: {
+      elements: [{ text_run: { content: String(content || '').slice(0, 1800) } }],
+    },
+  };
+}
+
+function firstMarkdownHeading(markdown) {
+  const match = String(markdown || '').match(/^#\s+(.+)$/m);
+  return match ? match[1].trim() : '';
+}
+
+function safeDocTitle(title) {
+  return String(title || 'Codex 文档').replace(/[\r\n\t]/g, ' ').replace(/[<>:"/\\|?*]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120) || 'Codex 文档';
 }
 
 async function sendStatus(chatId, replyToMessageId, contextId = chatId, contextLabel = '') {
@@ -1769,6 +1929,7 @@ function buildOutboundMediaPrompt(prompt, cwd) {
   return [
     '你可以突破纯文字限制和飞书用户沟通：',
     '- 发送图片、长图、截图、PDF、表格、压缩包或其他文件：先保存到本机当前工作目录或 data/ /private/tmp 下，然后在最终回复里写出绝对路径，或用 Markdown 链接引用，例如 `![长图](/path/to/long.png)`、`[报告](/path/to/report.pdf)`。桥接服务会自动上传这些本机路径到飞书；不要只描述“已生成”，要给出路径。',
+    '- 创建可评论的飞书文档：当用户要 specs、docs、PRD、设计文档、长说明或需要方便反馈的内容时，优先输出 fenced block：```feishu-doc title="文档标题"\\n# 标题\\n...Markdown 正文...\\n```。桥接会创建飞书文档并发送打开按钮，不要把长文档只贴成普通消息。',
     '- 渲染表格：在最终回复加入 fenced block：```feishu-table title="标题"\\n| 列1 | 列2 |\\n| --- | --- |\\n| ... | ... |\\n```。桥接会渲染成飞书表格卡片。',
     '- 发送交互卡片：在最终回复加入 fenced block：```feishu-actions\\n{"title":"选择下一步","body":"请选择","actions":[{"label":"方案A","prompt":"按方案A继续","type":"primary"},{"label":"方案B","prompt":"按方案B继续"}]}\\n```。用户点按钮后，桥接会把对应 prompt 作为同一 session 的新任务执行。',
     '- 高级卡片：如果需要完整自定义飞书卡片，可输出 ```feishu-card\\n{...完整 interactive card JSON...}\\n```。',
@@ -1803,11 +1964,13 @@ function collectOutboundMedia(text, cwd) {
 }
 
 function extractRichOutputs(text) {
-  const rich = { text: String(text || ''), tables: [], cards: [], actions: [] };
-  rich.text = rich.text.replace(/```(feishu-table|feishu-card|feishu-actions)([^\n`]*)\n([\s\S]*?)```/g, (_full, kind, attrs, body) => {
+  const rich = { text: String(text || ''), tables: [], cards: [], actions: [], docs: [] };
+  rich.text = rich.text.replace(/```(feishu-table|feishu-card|feishu-actions|feishu-doc)([^\n`]*)\n([\s\S]*?)```/g, (_full, kind, attrs, body) => {
     const content = String(body || '').trim();
     if (kind === 'feishu-table') {
       rich.tables.push({ title: attrValue(attrs, 'title') || '表格', content });
+    } else if (kind === 'feishu-doc') {
+      rich.docs.push({ title: attrValue(attrs, 'title') || firstMarkdownHeading(content) || 'Codex 文档', content });
     } else if (kind === 'feishu-card') {
       const card = parseJsonBlock(content);
       if (card) rich.cards.push(card);
