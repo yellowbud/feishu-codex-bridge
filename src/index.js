@@ -48,6 +48,8 @@ const config = {
   codexSessionsEnabled: process.env.FEISHU_CODEX_SESSIONS_ENABLED !== '0',
   streamOutput: process.env.FEISHU_STREAM_OUTPUT === '1',
   newChatGroupMessageType: process.env.FEISHU_NEW_CHAT_GROUP_MESSAGE_TYPE || 'thread',
+  outboundMediaEnabled: process.env.FEISHU_OUTBOUND_MEDIA_ENABLED !== '0',
+  outboundMediaDirs: splitList(process.env.FEISHU_OUTBOUND_MEDIA_DIRS),
 };
 
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
@@ -793,8 +795,9 @@ async function startCodexTask(prompt, source) {
   if (source.resetSession) clearChatSession(contextId, workspace.name);
   const existingSession = config.codexSessionsEnabled ? sessionForChat(contextId, workspace.name) : '';
   const shouldResume = Boolean(existingSession && !source.resetSession);
-  const codexPrompt = shouldResume ? prompt : buildPromptWithMemory(contextId, prompt, source.useMemory, workspace.name);
   const cwd = workspace.cwd;
+  const bridgePrompt = buildOutboundMediaPrompt(prompt, cwd);
+  const codexPrompt = shouldResume ? bridgePrompt : buildPromptWithMemory(contextId, bridgePrompt, source.useMemory, workspace.name);
   const args = shouldResume
     ? ['exec', 'resume', ...config.codexExtraArgs]
     : ['exec', ...config.codexExtraArgs];
@@ -1086,10 +1089,12 @@ async function sendTaskFinished(chatId, task, replyToMessageId) {
   const cancelled = task.verdict === '已取消/超时';
   const template = success ? 'green' : (cancelled ? 'orange' : 'red');
   const resultText = task.finalMessage || task.tail || '无输出。';
+  const media = success ? collectOutboundMedia(resultText, task.cwd) : [];
   const title = `Codex 任务${task.verdict}`;
   const meta = [
     `**任务 ID**：${task.taskId}`,
     `**耗时**：${formatDuration(task.elapsed)}`,
+    media.length ? `**附件**：${media.length} 个本机文件将单独发送` : null,
     success ? null : `**退出码**：${task.code ?? 'n/a'}`,
     success || !task.signal ? null : `**信号**：${task.signal}`,
   ].filter(Boolean).join('\n');
@@ -1106,6 +1111,9 @@ async function sendTaskFinished(chatId, task, replyToMessageId) {
         !task.finalMessage && task.tail ? { tag: 'markdown', content: '_未读取到最终回复文件，展示 CLI 尾部输出。_' } : null,
       ]),
     }, `${title}\n${meta}\n\n${resultText}`, replyToMessageId);
+  }
+  if (media.length) {
+    await sendOutboundMedia(chatId, media, replyToMessageId);
   }
 }
 
@@ -1234,6 +1242,75 @@ async function sendText(chatId, text, replyToMessageId) {
       await sendWebhookText(chunk);
     }
   }
+}
+
+async function sendOutboundMedia(chatId, media, replyToMessageId) {
+  for (const item of media) {
+    try {
+      if (item.kind === 'image') {
+        await sendImageFile(chatId, item.path, replyToMessageId);
+      } else {
+        await sendGenericFile(chatId, item.path, replyToMessageId);
+      }
+      log(`sent outbound media kind=${item.kind} path=${item.path}`);
+    } catch (err) {
+      log(`send outbound media failed path=${item.path}: ${err.stack || err.message || err}`);
+      await sendUiMessage(chatId, {
+        kind: 'warn',
+        title: '附件发送失败',
+        template: 'orange',
+        summary: path.basename(item.path),
+        body: `已保留本机路径：\`${item.path}\`\n${formatApiError(err)}`,
+      }, replyToMessageId);
+    }
+  }
+}
+
+async function sendImageFile(chatId, filePath, replyToMessageId) {
+  const uploaded = await client.im.image.create({
+    data: {
+      image_type: 'message',
+      image: fs.createReadStream(filePath),
+    },
+  });
+  const imageKey = uploaded && uploaded.image_key;
+  if (!imageKey) throw new Error(`image upload returned no image_key: ${JSON.stringify(uploaded).slice(0, 1000)}`);
+  await sendRawMessage(chatId, 'image', { image_key: imageKey }, replyToMessageId);
+}
+
+async function sendGenericFile(chatId, filePath, replyToMessageId) {
+  const uploaded = await client.im.file.create({
+    data: {
+      file_type: feishuFileType(filePath),
+      file_name: path.basename(filePath),
+      file: fs.createReadStream(filePath),
+    },
+  });
+  const fileKey = uploaded && uploaded.file_key;
+  if (!fileKey) throw new Error(`file upload returned no file_key: ${JSON.stringify(uploaded).slice(0, 1000)}`);
+  await sendRawMessage(chatId, 'file', { file_key: fileKey }, replyToMessageId);
+}
+
+async function sendRawMessage(chatId, msgType, content, replyToMessageId) {
+  if (replyToMessageId) {
+    await client.im.message.reply({
+      path: { message_id: replyToMessageId },
+      data: {
+        msg_type: msgType,
+        content: JSON.stringify(content),
+        reply_in_thread: true,
+      },
+    });
+    return;
+  }
+  await client.im.message.create({
+    params: { receive_id_type: 'chat_id' },
+    data: {
+      receive_id: chatId,
+      msg_type: msgType,
+      content: JSON.stringify(content),
+    },
+  });
 }
 
 async function sendWebhookText(text) {
@@ -1554,6 +1631,119 @@ function compactTail(text, max) {
   const cleaned = String(text || '').trim();
   if (!cleaned) return '';
   return cleaned.length > max ? `...\n${cleaned.slice(-max)}` : cleaned;
+}
+
+function buildOutboundMediaPrompt(prompt, cwd) {
+  if (!config.outboundMediaEnabled) return prompt;
+  return [
+    '你可以突破纯文字限制和飞书用户沟通：如果需要发送图片、截图、PDF、表格、压缩包或其他文件，请先把文件保存到本机当前工作目录或 data/ /private/tmp 下，然后在最终回复里写出绝对路径，或用 Markdown 链接引用，例如 `![图](/path/to/image.png)`、`[报告](/path/to/report.pdf)`。桥接服务会自动上传这些本机路径到飞书；不要只描述“已生成”，要给出路径。',
+    `当前工作目录：${cwd}`,
+    '',
+    '用户请求：',
+    prompt,
+  ].join('\n');
+}
+
+function collectOutboundMedia(text, cwd) {
+  if (!config.outboundMediaEnabled) return [];
+  const found = [];
+  const seen = new Set();
+  const value = String(text || '');
+  const patterns = [
+    /!\[[^\]]*]\(([^)\s]+)(?:\s+"[^"]*")?\)/g,
+    /\[[^\]]+]\(([^)\s]+)(?:\s+"[^"]*")?\)/g,
+    /(?:^|[\s`"'：:])((?:~|\/)[^\s`"'<>]+?\.(?:png|jpe?g|webp|gif|bmp|tiff?|ico|pdf|docx?|xlsx?|pptx?|csv|txt|md|json|zip|tar|gz|mp4|mov|m4a|mp3|wav))(?:$|[\s`"',，。；;）)])/gim,
+  ];
+  for (const pattern of patterns) {
+    for (const match of value.matchAll(pattern)) {
+      const raw = decodePathCandidate(match[1]);
+      const item = outboundMediaItem(raw, cwd);
+      if (!item || seen.has(item.path)) continue;
+      seen.add(item.path);
+      found.push(item);
+      if (found.length >= 8) return found;
+    }
+  }
+  return found;
+}
+
+function outboundMediaItem(rawPath, cwd) {
+  const resolved = resolveOutboundPath(rawPath, cwd);
+  if (!resolved) return null;
+  const stat = fileStat(resolved);
+  if (!stat || !stat.isFile() || stat.size <= 0) return null;
+  const kind = imageExtensions().has(path.extname(resolved).toLowerCase()) ? 'image' : 'file';
+  const max = kind === 'image' ? 10 * 1024 * 1024 : 30 * 1024 * 1024;
+  if (stat.size > max) return null;
+  return { kind, path: resolved, size: stat.size };
+}
+
+function resolveOutboundPath(rawPath, cwd) {
+  const raw = String(rawPath || '').trim().replace(/^file:\/\//, '');
+  if (!raw) return '';
+  const expanded = raw === '~' ? homeDir() : raw.replace(/^~(?=\/|$)/, homeDir());
+  const absolute = path.isAbsolute(expanded) ? expanded : path.resolve(cwd || config.codexCwd, expanded);
+  let real;
+  try {
+    real = fs.realpathSync(absolute);
+  } catch {
+    return '';
+  }
+  if (!isAllowedOutboundPath(real, cwd)) return '';
+  return real;
+}
+
+function isAllowedOutboundPath(filePath, cwd) {
+  const roots = [
+    cwd,
+    config.codexCwd,
+    DATA_DIR,
+    '/private/tmp',
+    ...config.outboundMediaDirs,
+  ].filter(Boolean);
+  return roots.some((root) => isInsidePath(filePath, root));
+}
+
+function isInsidePath(filePath, root) {
+  let realRoot;
+  try {
+    realRoot = fs.realpathSync(root);
+  } catch {
+    return false;
+  }
+  const relative = path.relative(realRoot, filePath);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function decodePathCandidate(value) {
+  try {
+    return decodeURIComponent(String(value || '').trim());
+  } catch {
+    return String(value || '').trim();
+  }
+}
+
+function imageExtensions() {
+  return new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.ico']);
+}
+
+function feishuFileType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.mp4' || ext === '.mov') return 'mp4';
+  if (ext === '.pdf') return 'pdf';
+  if (ext === '.doc' || ext === '.docx') return 'doc';
+  if (ext === '.xls' || ext === '.xlsx' || ext === '.csv') return 'xls';
+  if (ext === '.ppt' || ext === '.pptx') return 'ppt';
+  if (['.opus', '.mp3', '.m4a', '.wav'].includes(ext)) return 'opus';
+  return 'stream';
+}
+
+function fileStat(filePath) {
+  try {
+    return fs.statSync(filePath);
+  } catch {
+    return null;
+  }
 }
 
 function buildPromptWithMemory(chatId, prompt, useMemory, workspaceName = workspaceForChat(projectChatId(chatId)).name) {
