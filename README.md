@@ -96,9 +96,10 @@ Codex 也可以发回多媒体：如果最终回复里出现本机图片或文�
 /stop
 /cancel <taskId>
 /cd /Users/macmini/some-project
-/ws
-/ws add bridge /Users/macmini/feishu-codex-bridge
-/ws bridge
+/ws list
+/ws save bridge
+/ws use bridge
+/ws remove bridge
 ```
 
 说明：
@@ -112,8 +113,11 @@ Codex 也可以发回多媒体：如果最终回复里出现本机图片或文�
 - `/config` 打开偏好设置卡片，可调整消息回复方式、工具调用显示、并发上限、群内是否需要 @ bot。
 - `/timeout` 查看当前 session 的 run 探活设置；`/timeout 15` 表示 15 分钟无输出自动 kill；`/timeout off` 关闭；`/timeout default` 跟随全局默认。
 - `/account` 查看或切换当前绑定的 bot；`/account change <appId> <appSecret>` 更新 `.env` 并热重连。建议在私聊里执行，避免 secret 留在群记录里。
-- `/ws add <name> <目录>` 添加命名 workspace。
-- `/ws <name>` 在同一个飞书会话里切换 workspace。
+- `/cd <路径>` 切换当前 cwd，并重置当前 project/session。
+- `/ws list` 列出所有命名 workspace，并显示按钮一键切换。
+- `/ws save <名字>` 把当前 cwd 保存成命名 workspace，并为该 workspace 开新 session。
+- `/ws use <名字>` 切到指定命名 workspace。
+- `/ws remove <名字>` 删除命名 workspace。
 - 每个 workspace 都有自己的 Codex session，切回来会接着之前的上下文。
 - 图片和文件消息也会使用当前 workspace 与当前 Codex session。
 - 给任意消息添加配置里的 reaction emoji，会把那条消息一键转给 Codex 处理。

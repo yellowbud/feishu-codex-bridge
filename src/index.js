@@ -237,6 +237,10 @@ async function handleCardAction(data) {
     await handleResumeAction(evt, value);
     return;
   }
+  if (value.kind === 'bridge_workspace') {
+    await handleWorkspaceAction(evt, value);
+    return;
+  }
   if (value.kind !== 'codex_prompt' || !value.prompt) {
     log(`ignored card action message=${evt.messageId || 'unknown'} action=${JSON.stringify(value).slice(0, 500)}`);
     return;
@@ -308,6 +312,18 @@ async function handleResumeAction(evt, value) {
     ].join('\n'),
     body: '下一条消息会接着这个 Codex session 运行。',
   }, evt.messageId);
+}
+
+async function handleWorkspaceAction(evt, value) {
+  const chatId = value.chatId || evt.chatId;
+  if (!chatId || value.action !== 'use') return;
+  const operatorId = evt.operator && (evt.operator.openId || evt.operator.userId) || 'card-action';
+  const gateResult = gateAction({ chatId, senderId: operatorId, chatType: value.chatType || 'group' });
+  if (gateResult.action !== 'deliver') {
+    log(`workspace action access drop chat=${chatId} sender=${operatorId}`);
+    return;
+  }
+  await switchWorkspace(chatId, value.name, evt.messageId);
 }
 
 async function handleReactionCreated(data) {
@@ -712,7 +728,7 @@ async function createManagedChat(topic, source) {
       body: [
         `已继承工作目录：\`${inheritedWorkspace.cwd}\`。直接在群里发需求即可开始任务。`,
         '在话题群里每个话题是独立 session；普通群里每个消息 thread 是独立 session。',
-        '可用 `/cd <目录>` 绑定项目目录，或 `/ws add <name> <目录>` 管理多个 workspace。',
+        '可用 `/cd <目录>` 绑定项目目录，或 `/ws save <名字>` 保存当前 workspace。',
       ].join('\n'),
     });
     log(`created managed chat chat=${newChatId} owner=${source.senderId || 'unknown'} title=${title}`);
@@ -757,6 +773,11 @@ async function handleWorkspaceCommand(chatId, args, replyToMessageId) {
 
   if (!rawAction || ['list', 'ls', 'status', 'current'].includes(action)) {
     await sendWorkspaceStatus(chatId, replyToMessageId);
+    return;
+  }
+
+  if (action === 'save') {
+    await saveCurrentWorkspace(chatId, rest[0], replyToMessageId);
     return;
   }
 
@@ -821,6 +842,30 @@ async function addWorkspace(chatId, name, target, replyToMessageId) {
   }, replyToMessageId);
 }
 
+async function saveCurrentWorkspace(chatId, name, replyToMessageId) {
+  const workspaceName = normalizeWorkspaceName(name);
+  if (!workspaceName) {
+    await sendUiMessage(chatId, {
+      kind: 'warn',
+      title: '缺少 workspace 名称',
+      template: 'orange',
+      summary: '示例：`/ws save bridge`',
+    }, replyToMessageId);
+    return;
+  }
+  const current = workspaceForChat(chatId);
+  setNamedWorkspace(chatId, workspaceName, current.cwd, true);
+  clearChatSession(chatId, workspaceName);
+  resetConversation(chatId, workspaceName);
+  await sendUiMessage(chatId, {
+    kind: 'success',
+    title: 'Workspace 已保存',
+    template: 'green',
+    summary: `**${workspaceName}**\n${current.cwd}`,
+    body: `以后可用 \`/ws use ${workspaceName}\` 切回；已为该 workspace 开启新 session。`,
+  }, replyToMessageId);
+}
+
 async function switchWorkspace(chatId, name, replyToMessageId) {
   const workspaceName = normalizeWorkspaceName(name);
   if (!workspaceName) {
@@ -881,16 +926,34 @@ async function removeWorkspace(chatId, name, replyToMessageId) {
 async function sendWorkspaceStatus(chatId, replyToMessageId) {
   const state = workspaceStateForChat(chatId);
   const current = state.current;
-  const lines = Object.entries(state.items)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([name, workspace]) => `${name === current ? '•' : '-'} **${name}**：${workspace.cwd}`);
-  await sendUiMessage(chatId, {
-    kind: 'status',
-    title: 'Workspaces',
-    template: 'blue',
-    summary: `当前：**${current}**`,
-    body: lines.join('\n') || '暂无 workspace。',
-  }, replyToMessageId);
+  const entries = Object.entries(state.items).sort(([a], [b]) => a.localeCompare(b));
+  const lines = entries.map(([name, workspace]) => `${name === current ? '•' : '-'} **${escapeMarkdownLine(name)}**：${workspace.cwd}`);
+  const isGroup = Boolean(readAccessFile().groups[chatId]);
+  await sendCard(chatId, {
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: 'Workspaces' },
+    },
+    elements: cardElements([
+      { tag: 'markdown', content: `当前：**${escapeMarkdownLine(current)}**\n\n${lines.join('\n') || '暂无 workspace。'}` },
+      ...entries.map(([name]) => ({
+        tag: 'action',
+        actions: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: name === current ? `✓ ${name}` : `使用 ${name}` },
+          type: name === current ? 'primary' : 'default',
+          value: {
+            kind: 'bridge_workspace',
+            action: 'use',
+            chatId,
+            chatType: isGroup ? 'group' : 'p2p',
+            name,
+          },
+        }],
+      })),
+    ]),
+  }, `Workspaces\n当前：${current}\n${lines.join('\n')}`, replyToMessageId, { forceCard: true });
 }
 
 async function sendConfigForm(chatId, replyToMessageId, options = {}) {
@@ -2035,7 +2098,7 @@ async function sendHelp(chatId, replyToMessageId) {
     '`/stop` 停止当前飞书会话的运行中任务',
     '`/cancel <taskId>` 按任务 ID 取消',
     '`/cd <目录>` 切换当前飞书会话的工作目录',
-    '`/ws` 查看 workspace；`/ws add <name> <目录>` 添加；`/ws <name>` 切换',
+    '`/ws list` 查看 workspace；`/ws save <名字>` 保存；`/ws use <名字>` 切换；`/ws remove <名字>` 删除',
     '直接发送需求、图片或文件即可执行任务；已授权群聊无需 @机器人。',
     `给任意消息添加 ${config.codexReactionEmojis[0] || '配置的'} reaction，可一键转给 Codex 处理。`,
   ];
@@ -2433,7 +2496,7 @@ function helpText(chatId) {
     '停止当前会话任务：/stop',
     '取消指定任务：/cancel <taskId>',
     '切换目录：/cd <目录>',
-    '查看/切换 workspace：/ws',
+    '查看/切换 workspace：/ws list / /ws save <名字> / /ws use <名字> / /ws remove <名字>',
     '',
     `当前 workspace：${workspace.name}`,
     `当前会话工作目录：${workspace.cwd}`,
