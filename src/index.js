@@ -577,6 +577,28 @@ async function runCommand(command, source) {
     await handleReconnectCommand(chatId, messageId);
     return;
   }
+  if (command.kind === 'ps') {
+    await handlePsCommand(chatId, messageId);
+    return;
+  }
+  if (command.kind === 'exit') {
+    await handleExitCommand(command, { chatId, messageId });
+    return;
+  }
+  if (command.kind === 'doctor') {
+    await startCodexTask(buildDoctorPrompt(command.description, chatId), {
+      chatId,
+      messageId,
+      senderId,
+      contextId,
+      contextLabel: context && context.label,
+      chatType: context && context.chatType,
+      useMemory: false,
+      memoryReason: 'doctor',
+      resetSession: false,
+    });
+    return;
+  }
   if (command.kind === 'reset') {
     resetConversation(contextId);
     clearChatSession(contextId);
@@ -632,6 +654,9 @@ function parseCommand(rawText) {
   if (commandWithArgsAllowed && commandLower === 'account') return { kind: 'account', args: commandArgs };
   if (commandWithArgsAllowed && ['resume', '恢复'].includes(commandLower)) return { kind: 'resume', limit: clampInt(commandArgs[0] || 5, 1, 10) };
   if (exactCommand && ['reconnect', '重连'].includes(commandLower)) return { kind: 'reconnect' };
+  if (exactCommand && commandLower === 'ps') return { kind: 'ps' };
+  if (commandWithArgsAllowed && ['exit', '退出'].includes(commandLower)) return { kind: 'exit', target: commandArgs[0] || '' };
+  if (commandWithArgsAllowed && ['doctor', '诊断'].includes(commandLower)) return { kind: 'doctor', description: commandArgs.join(' ').trim() };
   if (commandWithArgsAllowed && commandLower === 'new' && (commandArgs[0] || '').toLowerCase() === 'chat') {
     return { kind: 'newChat', topic: commandArgs.slice(1).join(' ').trim() };
   }
@@ -767,6 +792,238 @@ async function createManagedChat(topic, source) {
     }, source.messageId);
     log(`create managed chat failed sender=${source.senderId || 'unknown'}: ${err.stack || err.message || err}`);
   }
+}
+
+async function handlePsCommand(chatId, replyToMessageId) {
+  let processes;
+  try {
+    processes = await listBridgeProcesses();
+  } catch (err) {
+    await sendUiMessage(chatId, {
+      kind: 'error',
+      title: '进程列表读取失败',
+      template: 'red',
+      summary: err.message || String(err),
+      body: '请确认当前系统允许 Node 进程执行 `/bin/ps`。',
+    }, replyToMessageId);
+    return;
+  }
+
+  if (!processes.length) {
+    await sendUiMessage(chatId, {
+      kind: 'warn',
+      title: '未找到 bridge 进程',
+      template: 'orange',
+      summary: `当前 Node PID：${process.pid}`,
+    }, replyToMessageId);
+    return;
+  }
+
+  const rows = processes.map((item, index) => [
+    `#${index + 1}`,
+    item.current ? `${item.pid} 当前回复` : String(item.pid),
+    String(item.ppid || '-'),
+    compactMiddle(singleLine(item.command), 150),
+  ]);
+  const table = [
+    '| ID | PID | PPID | Command |',
+    '| --- | --- | --- | --- |',
+    ...rows.map((cells) => `| ${cells.map(escapeTableCell).join(' | ')} |`),
+  ].join('\n');
+  await sendCard(chatId, {
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: 'Bridge 进程' },
+    },
+    elements: cardElements([
+      { tag: 'markdown', content: `${table}\n\n用 \`/exit #1\` 或 \`/exit <pid>\` 终止指定 bridge 进程。` },
+    ]),
+  }, `Bridge 进程\n${rows.map((row) => row.join('  ')).join('\n')}`, replyToMessageId, { forceCard: true });
+}
+
+async function handleExitCommand(command, source) {
+  const target = String(command.target || '').trim();
+  if (!target) {
+    await sendUiMessage(source.chatId, {
+      kind: 'warn',
+      title: '缺少进程 ID',
+      template: 'orange',
+      summary: '先用 `/ps` 查看，再执行 `/exit #1` 或 `/exit <pid>`。',
+    }, source.messageId);
+    return;
+  }
+
+  let processes;
+  try {
+    processes = await listBridgeProcesses();
+  } catch (err) {
+    await sendUiMessage(source.chatId, {
+      kind: 'error',
+      title: '退出失败',
+      template: 'red',
+      summary: `无法读取 bridge 进程列表：${err.message || err}`,
+    }, source.messageId);
+    return;
+  }
+
+  const selected = resolveBridgeProcessTarget(target, processes);
+  if (!selected) {
+    await sendUiMessage(source.chatId, {
+      kind: 'warn',
+      title: '未找到可退出的 bridge 进程',
+      template: 'orange',
+      summary: target,
+      body: '为避免误杀，`/exit` 只会终止 `/ps` 列出的 bridge 进程。',
+    }, source.messageId);
+    return;
+  }
+
+  if (selected.pid === process.pid) {
+    await sendUiMessage(source.chatId, {
+      kind: 'success',
+      title: '当前进程将退出',
+      template: 'orange',
+      summary: `PID ${selected.pid} 会先关闭 WebSocket 和运行中任务，再退出。`,
+    }, source.messageId);
+    setTimeout(shutdown, 500).unref();
+    return;
+  }
+
+  try {
+    process.kill(selected.pid, 'SIGTERM');
+    await sendUiMessage(source.chatId, {
+      kind: 'success',
+      title: '已发送退出信号',
+      template: 'green',
+      summary: `PID ${selected.pid}`,
+      body: compactMiddle(singleLine(selected.command), 300),
+    }, source.messageId);
+  } catch (err) {
+    await sendUiMessage(source.chatId, {
+      kind: 'error',
+      title: '退出失败',
+      template: 'red',
+      summary: `PID ${selected.pid}`,
+      body: err.message || String(err),
+    }, source.messageId);
+  }
+}
+
+async function listBridgeProcesses() {
+  const result = await spawnCollect('/bin/ps', ['-axo', 'pid=,ppid=,command='], { timeoutMs: 5000 });
+  if (result.code !== 0) {
+    throw new Error(result.stderr || result.stdout || `ps exited with code ${result.code}`);
+  }
+  const rows = result.stdout.split(/\r?\n/)
+    .map((line) => {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+      if (!match) return null;
+      return {
+        pid: Number(match[1]),
+        ppid: Number(match[2]),
+        command: match[3],
+      };
+    })
+    .filter(Boolean)
+    .filter(isBridgeProcess)
+    .sort((a, b) => a.pid - b.pid);
+  return rows.map((item) => ({ ...item, current: item.pid === process.pid }));
+}
+
+function isBridgeProcess(item) {
+  if (item.pid === process.pid) return true;
+  const command = String(item.command || '');
+  return command.includes(ROOT)
+    || command.includes('feishu-codex-bridge')
+    || command.includes('lark-channel-bridge');
+}
+
+function resolveBridgeProcessTarget(target, processes) {
+  const indexMatch = target.match(/^#(\d+)$/);
+  if (indexMatch) return processes[Number(indexMatch[1]) - 1] || null;
+  if (!/^\d+$/.test(target)) return null;
+  const pid = Number(target);
+  return processes.find((item) => item.pid === pid) || processes[pid - 1] || null;
+}
+
+function buildDoctorPrompt(description, chatId) {
+  const workspace = workspaceForChat(chatId);
+  const logs = recentBridgeLog(220, 28000);
+  const runningTasks = [...running.values()].map((task) => {
+    const elapsed = Math.round((Date.now() - task.startedAt) / 1000);
+    return `- ${task.id} workspace=${task.workspaceName || 'default'} cwd=${task.cwd} elapsed=${elapsed}s`;
+  }).join('\n') || '无';
+  return [
+    '你是 Feishu Codex Bridge 的自助诊断助手。请根据用户描述和最近日志诊断问题。',
+    '',
+    '输出要求：',
+    '1. 可能原因：按概率排序，区分“日志证据”和“推测”。',
+    '2. 关键日志：只摘出最相关的几条，并说明为什么重要。',
+    '3. 建议下一步：给出可以在这台机器上执行或在飞书后台检查的步骤。',
+    '4. 如果证据不足，明确还需要哪类日志或现象。',
+    '',
+    `用户描述：${description || '未提供具体描述，请只基于日志做体检。'}`,
+    '',
+    '当前 bridge 状态：',
+    `- pid=${process.pid}`,
+    `- cwd=${process.cwd()}`,
+    `- projectRoot=${ROOT}`,
+    `- defaultWorkspace=${workspace.cwd}`,
+    `- appId=${maskSecret(config.appId, 8, 4)}`,
+    `- runningTasks=${running.size}`,
+    runningTasks,
+    '',
+    '最近 bridge 日志：',
+    codeBlock(logs || '暂无日志。'),
+  ].join('\n');
+}
+
+function recentBridgeLog(maxLines, maxChars) {
+  const file = path.join(LOG_DIR, 'bridge.log');
+  try {
+    const text = fs.readFileSync(file, 'utf8');
+    const lines = text.split(/\r?\n/).filter(Boolean).slice(-maxLines);
+    return compactTail(lines.join('\n'), maxChars);
+  } catch (err) {
+    return `读取日志失败：${err.message || err}`;
+  }
+}
+
+function spawnCollect(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd || ROOT,
+      env: { ...process.env, PATH: buildPath() },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const maxBuffer = options.maxBuffer || 2 * 1024 * 1024;
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error(`${command} timed out`));
+    }, options.timeoutMs || 10000);
+    timer.unref();
+    child.stdout.on('data', (chunk) => {
+      stdout = `${stdout}${chunk.toString()}`.slice(-maxBuffer);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = `${stderr}${chunk.toString()}`.slice(-maxBuffer);
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
+}
+
+function escapeTableCell(text) {
+  return String(text || '').replace(/\|/g, '\\|').replace(/\n/g, ' ').trim();
 }
 
 function chatTitle(topic) {
@@ -2155,6 +2412,9 @@ async function sendHelp(chatId, replyToMessageId) {
     '`/timeout [分钟|off|default]` 设置当前 session run 探活',
     '`/reconnect` 强制重连 Feishu WebSocket',
     '`/account` 查看应用；`/account change <appId> <secret>` 热切换应用',
+    '`/ps` 查看本机 bridge 进程，并标出当前回复进程',
+    '`/exit #1` 或 `/exit <pid>` 终止指定 bridge 进程',
+    '`/doctor [描述]` 用最近日志生成故障诊断',
     '`/new` 开始新任务并清空当前会话上下文',
     '`/new chat <名字>` 自动创建一个新 project 群',
     '`/resume [N]` 列出最近 N 个历史会话并一键恢复',
@@ -2554,6 +2814,9 @@ function helpText(chatId) {
     '当前 session 探活：/timeout 15 / /timeout off / /timeout default',
     '强制重连：/reconnect',
     '查看/切换飞书应用：/account',
+    '查看 bridge 进程：/ps',
+    '退出指定 bridge 进程：/exit #1 或 /exit <pid>',
+    '日志诊断：/doctor bot 没回复',
     '新任务：/new',
     '新建 project 群：/new chat <名字>',
     '恢复历史会话：/resume 5',

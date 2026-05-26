@@ -91,6 +91,9 @@ Codex 也可以发回多媒体：如果最终回复里出现本机图片或文�
 /reconnect
 /account
 /account change <appId> <appSecret>
+/ps
+/exit #1
+/doctor bot 没回复
 /new
 /new chat 新项目名字
 /resume 5
@@ -116,6 +119,9 @@ Codex 也可以发回多媒体：如果最终回复里出现本机图片或文�
 - `/stop` 终止当前 thread 正在跑的任务；任务开始卡片底部的 `⏹ 终止` 按钮等同于 `/stop`。
 - `/reconnect` 强制重连 Feishu WebSocket，适合网络抖动后 bot 没反应时使用。
 - `/account` 查看或切换当前绑定的 bot；`/account change <appId> <appSecret>` 更新 `.env` 并热重连。建议在私聊里执行，避免 secret 留在群记录里。
+- `/ps` 列出本机 bridge 进程，并标出当前正在回复这个群消息的进程。
+- `/exit #1` 或 `/exit <pid>` 终止指定 bridge 进程；关当前进程会先 graceful 退出，关其他 bridge 进程会发 SIGTERM。
+- `/doctor [描述]` 把最近 bridge 日志和故障描述交给 Codex 做自助诊断，返回可能原因、关键日志和下一步建议。
 - `/cd <路径>` 切换当前 cwd，并重置当前 project/session。
 - `/ws list` 列出所有命名 workspace，并显示按钮一键切换。
 - `/ws save <名字>` 把当前 cwd 保存成命名 workspace，并为该 workspace 开新 session。
