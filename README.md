@@ -63,6 +63,8 @@ tail -f logs/bridge.log
 
 看到别人发的消息，也可以一键转给 Codex：给那条消息点机器人表情 reaction，机器人会读取原消息并在同一个 thread 里处理。默认监听的 emoji 类型在 `.env` 的 `FEISHU_CODEX_REACTION_EMOJIS` 配置。
 
+所有可见对话都会留在飞书里：用户原消息、任务开始卡片、实际交给 Codex 的输入摘要、最终回复、飞书文档、表格卡片和附件都会回写到同一个 thread，方便搜索、存档、回顾和转发。`data/` 里的 session、workspace、附件和 memory 文件只是本机运行缓存，不作为主要记录。
+
 Codex 也可以发回多媒体：如果最终回复里出现本机图片或文件路径，桥接会自动上传到飞书。例如 Codex 生成 `report.pdf`、`chart.png`、截图或压缩包后，只要在回复里写出绝对路径或 Markdown 链接，就会作为附件发回。
 
 长文档会自动变成飞书文档：当你让 Codex 写 specs、docs、PRD、设计方案或长说明时，它可以创建飞书文档并发回打开按钮，大家可以直接在文档里评论反馈。
@@ -103,6 +105,7 @@ Codex 也可以发回多媒体：如果最终回复里出现本机图片或文�
 - 每个 workspace 都有自己的 Codex session，切回来会接着之前的上下文。
 - 图片和文件消息也会使用当前 workspace 与当前 Codex session。
 - 给任意消息添加配置里的 reaction emoji，会把那条消息一键转给 Codex 处理。
+- 每个任务都会在开始卡片里记录“输入归档”，所以按钮、reaction、附件等非手打指令也能在飞书里检索和回顾。
 - Codex 生成的本机图片/文件会自动作为飞书附件发送，默认只允许当前 workspace、`CODEX_CWD`、`data/` 和 `/private/tmp` 下的文件。
 - Codex 可以输出 `feishu-doc` 代码块创建飞书文档，适合 specs/docs/PRD/设计文档，方便在飞书里阅读和评论。
 - Codex 可以输出 `feishu-table` 代码块渲染表格，输出 `feishu-actions` 代码块生成按钮卡片；按钮点击会自动作为同一 session 的下一条指令执行。

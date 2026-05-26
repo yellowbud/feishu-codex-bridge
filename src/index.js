@@ -53,6 +53,8 @@ const config = {
   feishuDocFolderToken: process.env.FEISHU_DOC_FOLDER_TOKEN || '',
   feishuDocBaseUrl: process.env.FEISHU_DOC_BASE_URL || 'https://www.feishu.cn/docx',
   codexReactionEmojis: splitList(process.env.FEISHU_CODEX_REACTION_EMOJIS || 'RobotFace,robot_face,ROBOT_FACE'),
+  archivePrompts: process.env.FEISHU_ARCHIVE_PROMPTS !== '0',
+  archivePromptMaxChars: Number(process.env.FEISHU_ARCHIVE_PROMPT_MAX_CHARS || 1800),
 };
 
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
@@ -1023,6 +1025,7 @@ async function startCodexTask(prompt, source) {
     contextLabel: source.contextLabel,
     useMemory: source.useMemory,
     memoryReason: source.memoryReason,
+    prompt,
   }, source.messageId);
   log(`task ${taskId} start from=${source.senderId || 'unknown'} chat=${source.chatId} context=${contextId} workspace=${workspace.name} cwd=${cwd} session=${shouldResume ? existingSession : 'new'} memory=${source.useMemory ? source.memoryReason : 'new'} prompt=${singleLine(prompt).slice(0, 500)}`);
 
@@ -1277,6 +1280,7 @@ async function sendTaskStarted(chatId, task, replyToMessageId) {
     `**Codex session**：${task.isResume ? `继续 ${task.sessionId}` : '新建'}`,
     `**上下文**：${task.isResume ? '使用 Codex 原生会话' : (task.useMemory ? `继续模式（${task.memoryReason || 'explicit'}）` : '新任务隔离')}`,
   ].filter(Boolean).join('\n');
+  const promptArchive = config.archivePrompts ? archivePromptText(task.prompt) : '';
   await sendCard(chatId, {
     header: {
       template: 'blue',
@@ -1284,6 +1288,7 @@ async function sendTaskStarted(chatId, task, replyToMessageId) {
     },
     elements: cardElements([
       { tag: 'markdown', content: `任务已开始，完成后会直接返回结果。\n\n${details}` },
+      promptArchive ? { tag: 'markdown', content: `**输入归档**\n${promptArchive}` } : null,
     ]),
   }, `Codex 已接收\n${details}`, replyToMessageId);
 }
@@ -2024,6 +2029,13 @@ function cardElements(elements) {
 
 function codeBlock(text) {
   return `\`\`\`\n${String(text || '').replace(/```/g, '``\\`')}\n\`\`\``;
+}
+
+function archivePromptText(prompt) {
+  const text = String(prompt || '').trim();
+  if (!text) return '';
+  const max = Math.max(200, Math.min(config.archivePromptMaxChars || 1800, 6000));
+  return codeBlock(compactMiddle(text, max));
 }
 
 function compactMiddle(text, max) {
