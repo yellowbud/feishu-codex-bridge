@@ -47,6 +47,7 @@ const config = {
   memoryMaxChars: Number(process.env.FEISHU_MEMORY_MAX_CHARS || 240000),
   codexSessionsEnabled: process.env.FEISHU_CODEX_SESSIONS_ENABLED !== '0',
   streamOutput: process.env.FEISHU_STREAM_OUTPUT === '1',
+  newChatGroupMessageType: process.env.FEISHU_NEW_CHAT_GROUP_MESSAGE_TYPE || 'thread',
 };
 
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
@@ -113,6 +114,7 @@ async function handleIncomingMessage(data) {
   const messageId = message.message_id;
   const messageType = message.message_type;
   const chatType = message.chat_type;
+  const context = messageContext(message);
   const text = extractText(message);
   const attachments = extractAttachments(message);
   const mentions = Array.isArray(message.mentions) ? message.mentions : [];
@@ -120,7 +122,7 @@ async function handleIncomingMessage(data) {
 
   if (!chatId || !messageId || !senderId) return;
   if (!text && !attachments.length) return;
-  log(`message received chat=${chatId} type=${chatType || 'unknown'} messageType=${messageType || 'unknown'} sender=${senderId} mentions=${mentions.length} attachments=${attachments.length} text=${singleLine(text).slice(0, 120)}`);
+  log(`message received chat=${chatId} context=${context.contextId} type=${chatType || 'unknown'} messageType=${messageType || 'unknown'} sender=${senderId} mentions=${mentions.length} attachments=${attachments.length} text=${singleLine(text).slice(0, 120)}`);
   if (config.allowedChatIds.length && !config.allowedChatIds.includes(chatId)) {
     log(`ignored message from unauthorized chat ${chatId}`);
     return;
@@ -151,6 +153,7 @@ async function handleIncomingMessage(data) {
       chatId,
       messageId,
       senderId,
+      context,
       text,
       message,
       attachments,
@@ -177,13 +180,15 @@ async function handleIncomingMessage(data) {
       chatId,
       messageId,
       senderId,
+      contextId: context.contextId,
+      contextLabel: context.label,
       useMemory: command.useMemory,
       memoryReason: command.memoryReason,
       resetSession: command.resetSession,
     });
     return;
   }
-  await runCommand(command, chatId, messageId);
+  await runCommand(command, { chatId, messageId, senderId, context });
 }
 
 async function handleAttachmentMessage(input) {
@@ -215,7 +220,12 @@ async function handleAttachmentMessage(input) {
   const rawText = stripMention(input.text || '').trim();
   const parsed = rawText ? parseCommand(rawText) : null;
   if (parsed && parsed.kind !== 'run') {
-    await runCommand(parsed, input.chatId, input.messageId);
+    await runCommand(parsed, {
+      chatId: input.chatId,
+      messageId: input.messageId,
+      senderId: input.senderId,
+      context: input.context,
+    });
     return;
   }
 
@@ -234,35 +244,43 @@ async function handleAttachmentMessage(input) {
     chatId: input.chatId,
     messageId: input.messageId,
     senderId: input.senderId,
+    contextId: input.context && input.context.contextId,
+    contextLabel: input.context && input.context.label,
     useMemory: parsed && parsed.kind === 'run' ? parsed.useMemory : memoryHint.useMemory,
     memoryReason: parsed && parsed.kind === 'run' ? parsed.memoryReason : memoryHint.reason,
     resetSession: parsed && parsed.kind === 'run' ? parsed.resetSession : memoryHint.resetSession,
   });
 }
 
-async function runCommand(command, chatId, messageId) {
+async function runCommand(command, source) {
   if (!command) return;
+  const { chatId, messageId, senderId, context } = source;
+  const contextId = context && context.contextId ? context.contextId : chatId;
   if (command.kind === 'help') {
     await sendHelp(chatId, messageId);
     return;
   }
   if (command.kind === 'status') {
-    await sendStatus(chatId, messageId);
+    await sendStatus(chatId, messageId, contextId, context && context.label);
     return;
   }
   if (command.kind === 'reset') {
-    resetConversation(chatId);
-    clearChatSession(chatId);
+    resetConversation(contextId);
+    clearChatSession(contextId);
     await sendUiMessage(chatId, {
       kind: 'success',
       title: '新会话已开始',
       template: 'green',
-      summary: '当前飞书会话的 Codex session 和上下文记忆已重置。',
+      summary: `${context && context.label ? context.label : '当前会话'}的 Codex session 和上下文记忆已重置。`,
     }, messageId);
     return;
   }
+  if (command.kind === 'newChat') {
+    await createManagedChat(command.topic, { chatId, messageId, senderId });
+    return;
+  }
   if (command.kind === 'cd') {
-    await handleCd(chatId, command.target, messageId);
+    await handleCd(chatId, command.target, messageId, contextId);
     return;
   }
   if (command.kind === 'ws') {
@@ -270,7 +288,7 @@ async function runCommand(command, chatId, messageId) {
     return;
   }
   if (command.kind === 'stop') {
-    await cancelChatTasks(chatId, messageId);
+    await cancelChatTasks(chatId, messageId, { contextId });
     return;
   }
   if (command.kind === 'cancel') {
@@ -296,6 +314,9 @@ function parseCommand(rawText) {
 
   if (!body || (exactCommand && ['help', '帮助'].includes(commandLower))) return { kind: 'help' };
   if (exactCommand && ['status', '状态'].includes(commandLower)) return { kind: 'status' };
+  if (commandWithArgsAllowed && commandLower === 'new' && (commandArgs[0] || '').toLowerCase() === 'chat') {
+    return { kind: 'newChat', topic: commandArgs.slice(1).join(' ').trim() };
+  }
   if (exactCommand && ['new', 'reset', 'clear', 'forget', '清空上下文', '清空记忆', '忘记'].includes(commandLower)) {
     return { kind: 'reset' };
   }
@@ -373,6 +394,80 @@ function readAccessFile() {
     log('access.json is corrupt, moved aside. Starting fresh.');
     return defaultAccess();
   }
+}
+
+async function createManagedChat(topic, source) {
+  const title = chatTitle(topic);
+  try {
+    const response = await client.im.chat.create({
+      params: {
+        user_id_type: 'open_id',
+        uuid: `new-chat-${Date.now()}-${randomBytes(4).toString('hex')}`,
+      },
+      data: {
+        name: title,
+        description: '由 Feishu Codex Bridge 自动创建。一个群代表一个 project，群内每个 thread/topic 代表一个独立 Codex session。',
+        user_id_list: source.senderId ? [source.senderId] : [],
+        group_message_type: config.newChatGroupMessageType === 'chat' ? 'chat' : 'thread',
+        chat_type: 'private',
+      },
+    });
+    const newChatId = response && response.data && response.data.chat_id;
+    if (!newChatId) throw new Error(`create chat returned no chat_id: ${JSON.stringify(response).slice(0, 1000)}`);
+
+    allowManagedGroup(newChatId, source.senderId);
+    await sendUiMessage(source.chatId, {
+      kind: 'success',
+      title: '新群聊已创建',
+      template: 'green',
+      summary: `**${title}**\nchat_id: ${newChatId}`,
+      body: '机器人已把你拉入新群。后续在新群里直接发消息即可；每个话题/thread 会保留自己的 Codex session。',
+    }, source.messageId);
+    await sendUiMessage(newChatId, {
+      kind: 'success',
+      title: title,
+      template: 'blue',
+      summary: '这个群就是一个 project。',
+      body: [
+        '直接在群里发需求即可开始任务。',
+        '在话题群里每个话题是独立 session；普通群里每个消息 thread 是独立 session。',
+        '可用 `/cd <目录>` 绑定项目目录，或 `/ws add <name> <目录>` 管理多个 workspace。',
+      ].join('\n'),
+    });
+    log(`created managed chat chat=${newChatId} owner=${source.senderId || 'unknown'} title=${title}`);
+  } catch (err) {
+    await sendUiMessage(source.chatId, {
+      kind: 'error',
+      title: '创建群聊失败',
+      template: 'red',
+      summary: formatApiError(err),
+      body: '请确认飞书应用有创建群、拉用户入群相关权限，并已重新发布自建应用版本。',
+    }, source.messageId);
+    log(`create managed chat failed sender=${source.senderId || 'unknown'}: ${err.stack || err.message || err}`);
+  }
+}
+
+function chatTitle(topic) {
+  const cleaned = String(topic || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return `Codex Project ${new Date().toISOString().slice(0, 10)}`;
+  return cleaned.length > 60 ? cleaned.slice(0, 60) : cleaned;
+}
+
+function allowManagedGroup(chatId, senderId) {
+  if (!config.accessEnabled || !chatId) return;
+  const access = readAccessFile();
+  access.groups = access.groups && typeof access.groups === 'object' ? access.groups : {};
+  const existing = access.groups[chatId] && typeof access.groups[chatId] === 'object' ? access.groups[chatId] : {};
+  const allowFrom = Array.isArray(existing.allowFrom) ? existing.allowFrom.slice() : [];
+  if (senderId && !allowFrom.includes(senderId)) allowFrom.push(senderId);
+  access.groups[chatId] = {
+    ...existing,
+    requireMention: false,
+    allowFrom,
+    createdBy: existing.createdBy || senderId,
+    createdAt: existing.createdAt || new Date().toISOString(),
+  };
+  saveAccess(access);
 }
 
 async function handleWorkspaceCommand(chatId, args, replyToMessageId) {
@@ -517,7 +612,7 @@ async function sendWorkspaceStatus(chatId, replyToMessageId) {
   }, replyToMessageId);
 }
 
-async function handleCd(chatId, target, replyToMessageId) {
+async function handleCd(chatId, target, replyToMessageId, contextId = chatId) {
   const resolved = resolveWorkspacePath(target, cwdForChat(chatId));
   if (!resolved.ok) {
     await sendUiMessage(chatId, {
@@ -532,14 +627,16 @@ async function handleCd(chatId, target, replyToMessageId) {
 
   await cancelChatTasks(chatId, replyToMessageId, { quietWhenEmpty: true });
   setChatCwd(chatId, resolved.path);
-  clearChatSession(chatId);
-  resetConversation(chatId);
+  clearProjectSessions(chatId);
+  resetProjectConversations(chatId);
+  clearChatSession(contextId);
+  resetConversation(contextId);
   await sendUiMessage(chatId, {
     kind: 'success',
     title: '工作目录已切换',
     template: 'green',
     summary: `**当前目录**：${resolved.path}`,
-    body: '已同时清空当前飞书会话的 Codex session 和上下文，避免新项目串到旧任务。',
+    body: '已同时清空当前 project 下的 Codex session 和上下文，避免新项目串到旧任务。',
   }, replyToMessageId);
 }
 
@@ -692,10 +789,11 @@ async function startCodexTask(prompt, source) {
   const startedAt = Date.now();
   const outputFile = path.join(DATA_DIR, `${taskId}.last-message.txt`);
   const workspace = workspaceForChat(source.chatId);
-  if (source.resetSession) clearChatSession(source.chatId);
-  const existingSession = config.codexSessionsEnabled ? sessionForChat(source.chatId, workspace.name) : '';
+  const contextId = source.contextId || source.chatId;
+  if (source.resetSession) clearChatSession(contextId, workspace.name);
+  const existingSession = config.codexSessionsEnabled ? sessionForChat(contextId, workspace.name) : '';
   const shouldResume = Boolean(existingSession && !source.resetSession);
-  const codexPrompt = shouldResume ? prompt : buildPromptWithMemory(source.chatId, prompt, source.useMemory, workspace.name);
+  const codexPrompt = shouldResume ? prompt : buildPromptWithMemory(contextId, prompt, source.useMemory, workspace.name);
   const cwd = workspace.cwd;
   const args = shouldResume
     ? ['exec', 'resume', ...config.codexExtraArgs]
@@ -715,10 +813,11 @@ async function startCodexTask(prompt, source) {
     cwd,
     sessionId: shouldResume ? existingSession : '',
     isResume: shouldResume,
+    contextLabel: source.contextLabel,
     useMemory: source.useMemory,
     memoryReason: source.memoryReason,
   }, source.messageId);
-  log(`task ${taskId} start from=${source.senderId || 'unknown'} chat=${source.chatId} workspace=${workspace.name} cwd=${cwd} session=${shouldResume ? existingSession : 'new'} memory=${source.useMemory ? source.memoryReason : 'new'} prompt=${singleLine(prompt).slice(0, 500)}`);
+  log(`task ${taskId} start from=${source.senderId || 'unknown'} chat=${source.chatId} context=${contextId} workspace=${workspace.name} cwd=${cwd} session=${shouldResume ? existingSession : 'new'} memory=${source.useMemory ? source.memoryReason : 'new'} prompt=${singleLine(prompt).slice(0, 500)}`);
 
   const child = spawn(config.codexBin, args, {
     cwd,
@@ -733,6 +832,7 @@ async function startCodexTask(prompt, source) {
     id: taskId,
     child,
     chatId: source.chatId,
+    contextId,
     messageId: source.messageId,
     startedAt,
     output: '',
@@ -783,9 +883,9 @@ async function startCodexTask(prompt, source) {
     const finalMessage = readFinalMessage(task);
     if (code === 0 && !signal && finalMessage) {
       if (config.codexSessionsEnabled && task.sessionId) {
-        setChatSession(source.chatId, task.sessionId, cwd, taskId, task.workspaceName);
+        setChatSession(contextId, task.sessionId, cwd, taskId, task.workspaceName);
       }
-      appendConversationTurn(source.chatId, task.userPrompt, finalMessage, task.workspaceName);
+      appendConversationTurn(contextId, task.userPrompt, finalMessage, task.workspaceName);
     }
     await sendTaskFinished(source.chatId, {
       taskId,
@@ -916,7 +1016,10 @@ async function cancelTask(taskId, chatId, replyToMessageId) {
 }
 
 async function cancelChatTasks(chatId, replyToMessageId, options = {}) {
-  const tasks = Array.from(running.values()).filter((task) => task.chatId === chatId);
+  const tasks = Array.from(running.values()).filter((task) => {
+    if (task.chatId !== chatId) return false;
+    return !options.contextId || task.contextId === options.contextId;
+  });
   if (!tasks.length) {
     if (!options.quietWhenEmpty) {
       await sendUiMessage(chatId, {
@@ -936,7 +1039,7 @@ async function cancelChatTasks(chatId, replyToMessageId, options = {}) {
   }
   await sendUiMessage(chatId, {
     kind: 'cancel',
-    title: '已请求停止当前会话任务',
+    title: options.contextId ? '已请求停止当前 thread 任务' : '已请求停止当前会话任务',
     template: 'orange',
     summary: tasks.map((task) => task.id).join('\n'),
   }, replyToMessageId);
@@ -961,11 +1064,12 @@ async function sendUiMessage(chatId, message, replyToMessageId) {
 async function sendTaskStarted(chatId, task, replyToMessageId) {
   const details = [
     `**任务 ID**：${task.taskId}`,
+    task.contextLabel ? `**Session scope**：${task.contextLabel}` : null,
     `**Workspace**：${task.workspaceName || 'default'}`,
     `**工作目录**：${task.cwd}`,
     `**Codex session**：${task.isResume ? `继续 ${task.sessionId}` : '新建'}`,
     `**上下文**：${task.isResume ? '使用 Codex 原生会话' : (task.useMemory ? `继续模式（${task.memoryReason || 'explicit'}）` : '新任务隔离')}`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
   await sendCard(chatId, {
     header: {
       template: 'blue',
@@ -1018,7 +1122,7 @@ async function sendLogChunk(chatId, taskId, chunk, replyToMessageId) {
   }, `任务 ${taskId} 实时输出：\n${chunk}`, replyToMessageId);
 }
 
-async function sendStatus(chatId, replyToMessageId) {
+async function sendStatus(chatId, replyToMessageId, contextId = chatId, contextLabel = '') {
   const fields = [];
   if (!running.size) {
     fields.push('**运行中任务**：0');
@@ -1030,9 +1134,10 @@ async function sendStatus(chatId, replyToMessageId) {
     }
   }
   const workspace = workspaceForChat(chatId);
+  if (contextLabel) fields.push(`**当前 session scope**：${contextLabel}`);
   fields.push(`**当前 workspace**：${workspace.name}`);
   fields.push(`**当前会话工作目录**：${workspace.cwd}`);
-  fields.push(`**当前会话 Codex session**：${sessionForChat(chatId) || '未创建'}`);
+  fields.push(`**当前 thread Codex session**：${sessionForChat(contextId, workspace.name) || '未创建'}`);
   fields.push(`**默认工作目录**：${config.codexCwd}`);
   fields.push(`**上下文记忆**：${memoryStatusText()}`);
   await sendCard(chatId, {
@@ -1041,7 +1146,7 @@ async function sendStatus(chatId, replyToMessageId) {
       title: { tag: 'plain_text', content: 'Feishu Codex Bridge 状态' },
     },
     elements: cardElements([{ tag: 'markdown', content: fields.join('\n') }]),
-  }, statusText(chatId), replyToMessageId);
+  }, statusText(chatId, contextId, contextLabel), replyToMessageId);
 }
 
 async function sendHelp(chatId, replyToMessageId) {
@@ -1049,6 +1154,7 @@ async function sendHelp(chatId, replyToMessageId) {
     '`/help` 查看帮助',
     '`/status` 查看状态',
     '`/new` 开始新任务并清空当前会话上下文',
+    '`/new chat <名字>` 自动创建一个新 project 群',
     '`/stop` 停止当前飞书会话的运行中任务',
     '`/cancel <taskId>` 按任务 ID 取消',
     '`/cd <目录>` 切换当前飞书会话的工作目录',
@@ -1064,21 +1170,32 @@ async function sendHelp(chatId, replyToMessageId) {
     elements: cardElements([
       { tag: 'markdown', content: commands.join('\n') },
       { tag: 'markdown', content: `**当前 workspace**：${workspace.name}\n**当前目录**：${workspace.cwd}\n**Codex session**：${sessionForChat(chatId) || '未创建'}` },
-      { tag: 'markdown', content: `**会话用法**\n每个飞书会话可以有多个 workspace，每个 workspace 保留自己的 Codex session。\n图片和文件会先下载到本机，再把路径交给 Codex 读取。\n需要彻底开新任务时用 \`/new\`。切换目录 \`/cd\` 会更新当前 workspace 并开启新 session。` },
+      { tag: 'markdown', content: `**会话用法**\n一个群就是一个 project；每个话题/thread 是独立 Codex session。\n图片和文件会先下载到本机，再把路径交给 Codex 读取。\n需要彻底开新任务时用 \`/new\`。需要新 project 群时用 \`/new chat <名字>\`。` },
     ]),
   }, helpText(chatId), replyToMessageId);
 }
 
 async function sendCard(chatId, card, fallbackText, replyToMessageId) {
   try {
-    await client.im.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: {
-        receive_id: chatId,
-        msg_type: 'interactive',
-        content: JSON.stringify(card),
-      },
-    });
+    if (replyToMessageId) {
+      await client.im.message.reply({
+        path: { message_id: replyToMessageId },
+        data: {
+          msg_type: 'interactive',
+          content: JSON.stringify(card),
+          reply_in_thread: true,
+        },
+      });
+    } else {
+      await client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: JSON.stringify(card),
+        },
+      });
+    }
   } catch (err) {
     log(`send card failed replyTo=${replyToMessageId || 'n/a'}: ${formatApiError(err)}`);
     await sendText(chatId, fallbackText, replyToMessageId);
@@ -1090,14 +1207,25 @@ async function sendText(chatId, text, replyToMessageId) {
   const limit = Math.max(1, Math.min(access.textChunkLimit || 3900, 3900));
   for (const chunk of chunkText(String(text || ''), limit, access.chunkMode || 'newline')) {
     try {
-      await client.im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          msg_type: 'text',
-          content: JSON.stringify({ text: chunk }),
-        },
-      });
+      if (replyToMessageId) {
+        await client.im.message.reply({
+          path: { message_id: replyToMessageId },
+          data: {
+            msg_type: 'text',
+            content: JSON.stringify({ text: chunk }),
+            reply_in_thread: true,
+          },
+        });
+      } else {
+        await client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'text',
+            content: JSON.stringify({ text: chunk }),
+          },
+        });
+      }
     } catch (err) {
       log(`send message failed replyTo=${replyToMessageId || 'n/a'}: ${formatApiError(err)}`);
     }
@@ -1124,6 +1252,27 @@ async function sendWebhookText(text) {
   } catch (err) {
     log(`webhook send failed: ${err.stack || err.message || err}`);
   }
+}
+
+function messageContext(message) {
+  const chatId = message.chat_id;
+  const chatType = message.chat_type;
+  if (!isGroupChat(chatType)) {
+    return {
+      chatId,
+      threadId: '',
+      contextId: chatId,
+      label: '私聊',
+    };
+  }
+
+  const threadId = message.thread_id || message.root_id || message.message_id;
+  return {
+    chatId,
+    threadId,
+    contextId: `${chatId}::thread:${threadId}`,
+    label: message.thread_id || message.root_id ? `thread ${threadId}` : `new thread ${threadId}`,
+  };
 }
 
 function extractText(message) {
@@ -1284,16 +1433,17 @@ function stripMention(text) {
     .trim();
 }
 
-function statusText(chatId) {
+function statusText(chatId, contextId = chatId, contextLabel = '') {
   const workspace = workspaceForChat(chatId);
-  if (!running.size) return `当前没有运行中的 Codex 任务。桥接服务在线。\n当前 workspace：${workspace.name}\n当前会话工作目录：${workspace.cwd}\n当前会话 Codex session：${sessionForChat(chatId) || '未创建'}\n${conversationStatusText()}`;
+  if (!running.size) return `当前没有运行中的 Codex 任务。桥接服务在线。\n${contextLabel ? `当前 session scope：${contextLabel}\n` : ''}当前 workspace：${workspace.name}\n当前会话工作目录：${workspace.cwd}\n当前 thread Codex session：${sessionForChat(contextId, workspace.name) || '未创建'}\n${conversationStatusText()}`;
   const lines = ['运行中的任务：'];
   for (const task of running.values()) {
     lines.push(`- ${task.id}，workspace=${task.workspaceName || 'default'}，已运行 ${Math.round((Date.now() - task.startedAt) / 1000)}s`);
   }
   lines.push(`当前 workspace：${workspace.name}`);
   lines.push(`当前会话工作目录：${workspace.cwd}`);
-  lines.push(`当前会话 Codex session：${sessionForChat(chatId) || '未创建'}`);
+  if (contextLabel) lines.push(`当前 session scope：${contextLabel}`);
+  lines.push(`当前 thread Codex session：${sessionForChat(contextId, workspace.name) || '未创建'}`);
   lines.push(conversationStatusText());
   return lines.join('\n');
 }
@@ -1320,6 +1470,7 @@ function helpText(chatId) {
     '执行任务：直接发送需求、图片或文件',
     '查看状态：/status',
     '新任务：/new',
+    '新建 project 群：/new chat <名字>',
     '停止当前会话任务：/stop',
     '取消指定任务：/cancel <taskId>',
     '切换目录：/cd <目录>',
@@ -1405,7 +1556,7 @@ function compactTail(text, max) {
   return cleaned.length > max ? `...\n${cleaned.slice(-max)}` : cleaned;
 }
 
-function buildPromptWithMemory(chatId, prompt, useMemory, workspaceName = workspaceForChat(chatId).name) {
+function buildPromptWithMemory(chatId, prompt, useMemory, workspaceName = workspaceForChat(projectChatId(chatId)).name) {
   if (!config.memoryEnabled) return prompt;
   if (!useMemory) return prompt;
   const conversation = loadConversation(chatId, workspaceName);
@@ -1427,7 +1578,7 @@ function buildPromptWithMemory(chatId, prompt, useMemory, workspaceName = worksp
   return trimFromStart(lines.join('\n'), config.memoryMaxChars + prompt.length + 1000);
 }
 
-function appendConversationTurn(chatId, userPrompt, assistantMessage, workspaceName = workspaceForChat(chatId).name) {
+function appendConversationTurn(chatId, userPrompt, assistantMessage, workspaceName = workspaceForChat(projectChatId(chatId)).name) {
   if (!config.memoryEnabled) return;
   const conversation = loadConversation(chatId, workspaceName);
   const turns = Array.isArray(conversation.turns) ? conversation.turns : [];
@@ -1452,7 +1603,7 @@ function trimConversation(turns) {
   return kept;
 }
 
-function loadConversation(chatId, workspaceName = workspaceForChat(chatId).name) {
+function loadConversation(chatId, workspaceName = workspaceForChat(projectChatId(chatId)).name) {
   try {
     const parsed = JSON.parse(fs.readFileSync(conversationPath(chatId, workspaceName), 'utf8'));
     return parsed && typeof parsed === 'object' ? parsed : { turns: [] };
@@ -1461,7 +1612,7 @@ function loadConversation(chatId, workspaceName = workspaceForChat(chatId).name)
   }
 }
 
-function saveConversation(chatId, conversation, workspaceName = workspaceForChat(chatId).name) {
+function saveConversation(chatId, conversation, workspaceName = workspaceForChat(projectChatId(chatId)).name) {
   try {
     fs.writeFileSync(conversationPath(chatId, workspaceName), `${JSON.stringify(conversation, null, 2)}\n`);
   } catch (err) {
@@ -1469,7 +1620,7 @@ function saveConversation(chatId, conversation, workspaceName = workspaceForChat
   }
 }
 
-function resetConversation(chatId, workspaceName = workspaceForChat(chatId).name) {
+function resetConversation(chatId, workspaceName = workspaceForChat(projectChatId(chatId)).name) {
   try {
     fs.rmSync(conversationPath(chatId, workspaceName), { force: true });
   } catch (err) {
@@ -1479,6 +1630,10 @@ function resetConversation(chatId, workspaceName = workspaceForChat(chatId).name
 
 function cwdForChat(chatId) {
   return workspaceForChat(chatId).cwd;
+}
+
+function projectChatId(contextId) {
+  return String(contextId || '').split('::thread:')[0] || contextId;
 }
 
 function setChatCwd(chatId, cwd) {
@@ -1589,7 +1744,7 @@ function saveWorkspaces(workspaces) {
   }
 }
 
-function sessionForChat(chatId, workspaceName = workspaceForChat(chatId).name) {
+function sessionForChat(chatId, workspaceName = workspaceForChat(projectChatId(chatId)).name) {
   if (!config.codexSessionsEnabled) return '';
   const sessions = loadSessions();
   const chat = sessions.chats && sessions.chats[chatId];
@@ -1626,7 +1781,7 @@ function setChatSession(chatId, sessionId, cwd, taskId, workspaceName = workspac
   saveSessions(sessions);
 }
 
-function clearChatSession(chatId, workspaceName = workspaceForChat(chatId).name) {
+function clearChatSession(chatId, workspaceName = workspaceForChat(projectChatId(chatId)).name) {
   const sessions = loadSessions();
   if (!sessions.chats || !sessions.chats[chatId]) return;
   const normalized = normalizeWorkspaceName(workspaceName) || 'default';
@@ -1639,6 +1794,20 @@ function clearChatSession(chatId, workspaceName = workspaceForChat(chatId).name)
     delete sessions.chats[chatId];
   }
   saveSessions(sessions);
+}
+
+function clearProjectSessions(chatId) {
+  const sessions = loadSessions();
+  if (!sessions.chats) return;
+  let changed = false;
+  const prefix = `${chatId}::thread:`;
+  for (const key of Object.keys(sessions.chats)) {
+    if (key === chatId || key.startsWith(prefix)) {
+      delete sessions.chats[key];
+      changed = true;
+    }
+  }
+  if (changed) saveSessions(sessions);
 }
 
 function sessionEntryForWorkspace(chat, workspaceName) {
@@ -1674,6 +1843,29 @@ function conversationPath(chatId, workspaceName = 'default') {
   const chatToken = safeFileToken(chatId);
   if (workspaceToken === 'default') return path.join(CONVERSATION_DIR, `${chatToken}.json`);
   return path.join(CONVERSATION_DIR, `${chatToken}__${workspaceToken}.json`);
+}
+
+function resetProjectConversations(chatId) {
+  let files;
+  try {
+    files = fs.readdirSync(CONVERSATION_DIR);
+  } catch {
+    return;
+  }
+  const prefixes = [
+    safeFileToken(chatId),
+    safeFileToken(`${chatId}::thread:`),
+  ];
+  for (const file of files) {
+    if (!file.endsWith('.json')) continue;
+    if (prefixes.some((prefix) => file.startsWith(prefix))) {
+      try {
+        fs.rmSync(path.join(CONVERSATION_DIR, file), { force: true });
+      } catch (err) {
+        log(`project conversation reset failed file=${file}: ${err.stack || err.message || err}`);
+      }
+    }
+  }
 }
 
 function safeFileToken(value) {

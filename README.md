@@ -42,7 +42,8 @@ tail -f logs/bridge.log
 4. 私聊消息需要机器人消息权限。
 5. 群里不 `@机器人` 也要收到消息时，开启权限：`获取群组中所有消息` / `im:message.group_msg`。
 6. 需要直接发送图片/文件时，开启权限：`获取消息中的资源文件`。
-7. 改权限后重新发布应用版本，并把机器人加入目标群。
+7. 需要 `/new chat` 自动建群时，开启创建群与拉用户入群相关权限。
+8. 改权限后重新发布应用版本，并把机器人加入目标群。
 
 如果没有 `im:message.group_msg`，飞书通常只会把 `@机器人` 的群消息投递给应用。
 
@@ -62,6 +63,7 @@ tail -f logs/bridge.log
 /help
 /status
 /new
+/new chat 新项目名字
 /stop
 /cancel <taskId>
 /cd /Users/macmini/some-project
@@ -72,8 +74,11 @@ tail -f logs/bridge.log
 
 说明：
 
+- 一个群就是一个 project。
+- 群里的每个话题/thread 都是一个独立 Codex session。
 - `/cd` 切换当前飞书会话的工作目录。
-- 每个飞书会话都有自己的 Codex session，下一条消息默认接着聊。
+- 机器人会在线程里回复；普通群里直接发一条新消息，会形成一个新的 thread/session。
+- `/new chat <名字>` 自动创建一个新项目群，并把你拉进去。
 - `/ws add <name> <目录>` 添加命名 workspace。
 - `/ws <name>` 在同一个飞书会话里切换 workspace。
 - 每个 workspace 都有自己的 Codex session，切回来会接着之前的上下文。
