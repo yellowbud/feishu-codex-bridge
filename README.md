@@ -62,15 +62,21 @@ tail -f logs/bridge.log
 /stop
 /cancel <taskId>
 /cd /Users/macmini/some-project
+/ws
+/ws add bridge /Users/macmini/feishu-codex-bridge
+/ws bridge
 ```
 
 说明：
 
 - `/cd` 切换当前飞书会话的工作目录。
 - 每个飞书会话都有自己的 Codex session，下一条消息默认接着聊。
+- `/ws add <name> <目录>` 添加命名 workspace。
+- `/ws <name>` 在同一个飞书会话里切换 workspace。
+- 每个 workspace 都有自己的 Codex session，切回来会接着之前的上下文。
 - `/new` 清空当前飞书会话的 Codex session，开启全新任务。
 - `/new <任务>` 开新 session 并立刻执行这个任务。
-- `/cd` 会同时开启新 session，避免新项目串到旧项目。
+- `/cd` 会更新当前 workspace 的目录，并同时开启新 session。
 
 ## 访问控制
 

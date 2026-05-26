@@ -179,6 +179,10 @@ async function handleIncomingMessage(data) {
     await handleCd(chatId, command.target, messageId);
     return;
   }
+  if (command.kind === 'ws') {
+    await handleWorkspaceCommand(chatId, command.args, messageId);
+    return;
+  }
   if (command.kind === 'stop') {
     await cancelChatTasks(chatId, messageId);
     return;
@@ -232,6 +236,7 @@ function parseCommand(rawText) {
     return { kind: 'cancel', taskId };
   }
   if (commandWithArgsAllowed && commandLower === 'cd') return { kind: 'cd', target: commandArgs.join(' ') };
+  if (commandWithArgsAllowed && commandLower === 'ws') return { kind: 'ws', args: commandArgs };
 
   const memoryHint = memoryHintForPrompt(body);
   return {
@@ -293,6 +298,148 @@ function readAccessFile() {
     log('access.json is corrupt, moved aside. Starting fresh.');
     return defaultAccess();
   }
+}
+
+async function handleWorkspaceCommand(chatId, args, replyToMessageId) {
+  const [rawAction = '', ...rest] = args;
+  const action = rawAction.toLowerCase();
+
+  if (!rawAction || ['list', 'ls', 'status', 'current'].includes(action)) {
+    await sendWorkspaceStatus(chatId, replyToMessageId);
+    return;
+  }
+
+  if (['add', 'set'].includes(action)) {
+    const [name, ...pathParts] = rest;
+    await addWorkspace(chatId, name, pathParts.join(' '), replyToMessageId);
+    return;
+  }
+
+  if (['use', 'switch'].includes(action)) {
+    await switchWorkspace(chatId, rest[0], replyToMessageId);
+    return;
+  }
+
+  if (['remove', 'rm', 'delete', 'del'].includes(action)) {
+    await removeWorkspace(chatId, rest[0], replyToMessageId);
+    return;
+  }
+
+  if (rest.length) {
+    await addWorkspace(chatId, rawAction, rest.join(' '), replyToMessageId);
+    return;
+  }
+
+  await switchWorkspace(chatId, rawAction, replyToMessageId);
+}
+
+async function addWorkspace(chatId, name, target, replyToMessageId) {
+  const workspaceName = normalizeWorkspaceName(name);
+  if (!workspaceName) {
+    await sendUiMessage(chatId, {
+      kind: 'warn',
+      title: '缺少 workspace 名称',
+      template: 'orange',
+      summary: '示例：`/ws add bridge /Users/macmini/feishu-codex-bridge`',
+    }, replyToMessageId);
+    return;
+  }
+
+  const resolved = resolveWorkspacePath(target, cwdForChat(chatId));
+  if (!resolved.ok) {
+    await sendUiMessage(chatId, {
+      kind: 'warn',
+      title: 'Workspace 未添加',
+      template: 'orange',
+      summary: resolved.message,
+      body: '示例：`/ws add bridge /Users/macmini/feishu-codex-bridge`',
+    }, replyToMessageId);
+    return;
+  }
+
+  await cancelChatTasks(chatId, replyToMessageId, { quietWhenEmpty: true });
+  setNamedWorkspace(chatId, workspaceName, resolved.path, true);
+  clearChatSession(chatId, workspaceName);
+  resetConversation(chatId, workspaceName);
+  await sendUiMessage(chatId, {
+    kind: 'success',
+    title: 'Workspace 已切换',
+    template: 'green',
+    summary: `**${workspaceName}**\n${resolved.path}`,
+    body: `以后可用 \`/ws ${workspaceName}\` 切回；该 workspace 会保留自己的 Codex session。`,
+  }, replyToMessageId);
+}
+
+async function switchWorkspace(chatId, name, replyToMessageId) {
+  const workspaceName = normalizeWorkspaceName(name);
+  if (!workspaceName) {
+    await sendUiMessage(chatId, {
+      kind: 'warn',
+      title: '缺少 workspace 名称',
+      template: 'orange',
+      summary: '示例：`/ws bridge`',
+    }, replyToMessageId);
+    return;
+  }
+
+  const workspace = namedWorkspaceForChat(chatId, workspaceName);
+  if (!workspace) {
+    await sendUiMessage(chatId, {
+      kind: 'warn',
+      title: '未找到 workspace',
+      template: 'orange',
+      summary: workspaceName,
+      body: '先添加：`/ws add <name> <目录>`',
+    }, replyToMessageId);
+    return;
+  }
+
+  await cancelChatTasks(chatId, replyToMessageId, { quietWhenEmpty: true });
+  setCurrentWorkspace(chatId, workspaceName);
+  await sendUiMessage(chatId, {
+    kind: 'success',
+    title: 'Workspace 已切换',
+    template: 'green',
+    summary: `**${workspaceName}**\n${workspace.cwd}`,
+    body: `Codex session：${sessionForChat(chatId) || '未创建'}`,
+  }, replyToMessageId);
+}
+
+async function removeWorkspace(chatId, name, replyToMessageId) {
+  const workspaceName = normalizeWorkspaceName(name);
+  if (!workspaceName || workspaceName === 'default') {
+    await sendUiMessage(chatId, {
+      kind: 'warn',
+      title: '不能删除该 workspace',
+      template: 'orange',
+      summary: workspaceName || '缺少名称',
+    }, replyToMessageId);
+    return;
+  }
+
+  const removed = deleteNamedWorkspace(chatId, workspaceName);
+  if (removed) clearChatSession(chatId, workspaceName);
+  await sendUiMessage(chatId, {
+    kind: removed ? 'success' : 'warn',
+    title: removed ? 'Workspace 已删除' : '未找到 workspace',
+    template: removed ? 'green' : 'orange',
+    summary: workspaceName,
+  }, replyToMessageId);
+}
+
+async function sendWorkspaceStatus(chatId, replyToMessageId) {
+  const state = workspaceStateForChat(chatId);
+  const current = state.current;
+  const lines = Object.entries(state.items)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, workspace]) => `${name === current ? '•' : '-'} **${name}**：${workspace.cwd}`);
+  await sendUiMessage(chatId, {
+    kind: 'status',
+    title: 'Workspaces',
+    template: 'blue',
+    summary: `当前：**${current}**`,
+    body: lines.join('\n') || '暂无 workspace。',
+  }, replyToMessageId);
 }
 
 async function handleCd(chatId, target, replyToMessageId) {
@@ -469,11 +616,12 @@ async function startCodexTask(prompt, source) {
   const taskId = `codex-${Date.now()}-${++taskSeq}`;
   const startedAt = Date.now();
   const outputFile = path.join(DATA_DIR, `${taskId}.last-message.txt`);
+  const workspace = workspaceForChat(source.chatId);
   if (source.resetSession) clearChatSession(source.chatId);
-  const existingSession = config.codexSessionsEnabled ? sessionForChat(source.chatId) : '';
+  const existingSession = config.codexSessionsEnabled ? sessionForChat(source.chatId, workspace.name) : '';
   const shouldResume = Boolean(existingSession && !source.resetSession);
-  const codexPrompt = shouldResume ? prompt : buildPromptWithMemory(source.chatId, prompt, source.useMemory);
-  const cwd = cwdForChat(source.chatId);
+  const codexPrompt = shouldResume ? prompt : buildPromptWithMemory(source.chatId, prompt, source.useMemory, workspace.name);
+  const cwd = workspace.cwd;
   const args = shouldResume
     ? ['exec', 'resume', ...config.codexExtraArgs]
     : ['exec', ...config.codexExtraArgs];
@@ -488,13 +636,14 @@ async function startCodexTask(prompt, source) {
 
   await sendTaskStarted(source.chatId, {
     taskId,
+    workspaceName: workspace.name,
     cwd,
     sessionId: shouldResume ? existingSession : '',
     isResume: shouldResume,
     useMemory: source.useMemory,
     memoryReason: source.memoryReason,
   }, source.messageId);
-  log(`task ${taskId} start from=${source.senderId || 'unknown'} chat=${source.chatId} cwd=${cwd} session=${shouldResume ? existingSession : 'new'} memory=${source.useMemory ? source.memoryReason : 'new'} prompt=${singleLine(prompt).slice(0, 500)}`);
+  log(`task ${taskId} start from=${source.senderId || 'unknown'} chat=${source.chatId} workspace=${workspace.name} cwd=${cwd} session=${shouldResume ? existingSession : 'new'} memory=${source.useMemory ? source.memoryReason : 'new'} prompt=${singleLine(prompt).slice(0, 500)}`);
 
   const child = spawn(config.codexBin, args, {
     cwd,
@@ -516,6 +665,7 @@ async function startCodexTask(prompt, source) {
     buffer: '',
     userPrompt: prompt,
     outputFile,
+    workspaceName: workspace.name,
     cwd,
     sessionId: shouldResume ? existingSession : '',
     jsonOutput: true,
@@ -558,9 +708,9 @@ async function startCodexTask(prompt, source) {
     const finalMessage = readFinalMessage(task);
     if (code === 0 && !signal && finalMessage) {
       if (config.codexSessionsEnabled && task.sessionId) {
-        setChatSession(source.chatId, task.sessionId, cwd, taskId);
+        setChatSession(source.chatId, task.sessionId, cwd, taskId, task.workspaceName);
       }
-      appendConversationTurn(source.chatId, task.userPrompt, finalMessage);
+      appendConversationTurn(source.chatId, task.userPrompt, finalMessage, task.workspaceName);
     }
     await sendTaskFinished(source.chatId, {
       taskId,
@@ -736,6 +886,7 @@ async function sendUiMessage(chatId, message, replyToMessageId) {
 async function sendTaskStarted(chatId, task, replyToMessageId) {
   const details = [
     `**任务 ID**：${task.taskId}`,
+    `**Workspace**：${task.workspaceName || 'default'}`,
     `**工作目录**：${task.cwd}`,
     `**Codex session**：${task.isResume ? `继续 ${task.sessionId}` : '新建'}`,
     `**上下文**：${task.isResume ? '使用 Codex 原生会话' : (task.useMemory ? `继续模式（${task.memoryReason || 'explicit'}）` : '新任务隔离')}`,
@@ -800,10 +951,12 @@ async function sendStatus(chatId, replyToMessageId) {
     fields.push(`**运行中任务**：${running.size}`);
     for (const task of running.values()) {
       const sameChat = task.chatId === chatId ? '当前会话' : '其他会话';
-      fields.push(`- ${task.id}，${sameChat}，已运行 ${formatDuration(Math.round((Date.now() - task.startedAt) / 1000))}`);
+      fields.push(`- ${task.id}，${sameChat}，workspace=${task.workspaceName || 'default'}，已运行 ${formatDuration(Math.round((Date.now() - task.startedAt) / 1000))}`);
     }
   }
-  fields.push(`**当前会话工作目录**：${cwdForChat(chatId)}`);
+  const workspace = workspaceForChat(chatId);
+  fields.push(`**当前 workspace**：${workspace.name}`);
+  fields.push(`**当前会话工作目录**：${workspace.cwd}`);
   fields.push(`**当前会话 Codex session**：${sessionForChat(chatId) || '未创建'}`);
   fields.push(`**默认工作目录**：${config.codexCwd}`);
   fields.push(`**上下文记忆**：${memoryStatusText()}`);
@@ -824,8 +977,10 @@ async function sendHelp(chatId, replyToMessageId) {
     '`/stop` 停止当前飞书会话的运行中任务',
     '`/cancel <taskId>` 按任务 ID 取消',
     '`/cd <目录>` 切换当前飞书会话的工作目录',
+    '`/ws` 查看 workspace；`/ws add <name> <目录>` 添加；`/ws <name>` 切换',
     '直接发送需求即可执行任务；已授权群聊无需 @机器人。',
   ];
+  const workspace = workspaceForChat(chatId);
   await sendCard(chatId, {
     header: {
       template: 'blue',
@@ -833,8 +988,8 @@ async function sendHelp(chatId, replyToMessageId) {
     },
     elements: cardElements([
       { tag: 'markdown', content: commands.join('\n') },
-      { tag: 'markdown', content: `**当前会话工作目录**：${cwdForChat(chatId)}\n**Codex session**：${sessionForChat(chatId) || '未创建'}` },
-      { tag: 'markdown', content: `**会话用法**\n每个飞书会话会保留自己的 Codex session，下一条消息默认接着聊。\n需要彻底开新任务时用 \`/new\`。切换目录 \`/cd\` 也会开启新 session。` },
+      { tag: 'markdown', content: `**当前 workspace**：${workspace.name}\n**当前目录**：${workspace.cwd}\n**Codex session**：${sessionForChat(chatId) || '未创建'}` },
+      { tag: 'markdown', content: `**会话用法**\n每个飞书会话可以有多个 workspace，每个 workspace 保留自己的 Codex session。\n需要彻底开新任务时用 \`/new\`。切换目录 \`/cd\` 会更新当前 workspace 并开启新 session。` },
     ]),
   }, helpText(chatId), replyToMessageId);
 }
@@ -913,12 +1068,14 @@ function stripMention(text) {
 }
 
 function statusText(chatId) {
-  if (!running.size) return `当前没有运行中的 Codex 任务。桥接服务在线。\n当前会话工作目录：${cwdForChat(chatId)}\n当前会话 Codex session：${sessionForChat(chatId) || '未创建'}\n${conversationStatusText()}`;
+  const workspace = workspaceForChat(chatId);
+  if (!running.size) return `当前没有运行中的 Codex 任务。桥接服务在线。\n当前 workspace：${workspace.name}\n当前会话工作目录：${workspace.cwd}\n当前会话 Codex session：${sessionForChat(chatId) || '未创建'}\n${conversationStatusText()}`;
   const lines = ['运行中的任务：'];
   for (const task of running.values()) {
-    lines.push(`- ${task.id}，已运行 ${Math.round((Date.now() - task.startedAt) / 1000)}s`);
+    lines.push(`- ${task.id}，workspace=${task.workspaceName || 'default'}，已运行 ${Math.round((Date.now() - task.startedAt) / 1000)}s`);
   }
-  lines.push(`当前会话工作目录：${cwdForChat(chatId)}`);
+  lines.push(`当前 workspace：${workspace.name}`);
+  lines.push(`当前会话工作目录：${workspace.cwd}`);
   lines.push(`当前会话 Codex session：${sessionForChat(chatId) || '未创建'}`);
   lines.push(conversationStatusText());
   return lines.join('\n');
@@ -939,6 +1096,7 @@ function memoryStatusText() {
 }
 
 function helpText(chatId) {
+  const workspace = workspaceForChat(chatId);
   return [
     'Feishu Codex Bridge 在线。',
     '',
@@ -948,8 +1106,10 @@ function helpText(chatId) {
     '停止当前会话任务：/stop',
     '取消指定任务：/cancel <taskId>',
     '切换目录：/cd <目录>',
+    '查看/切换 workspace：/ws',
     '',
-    `当前会话工作目录：${cwdForChat(chatId)}`,
+    `当前 workspace：${workspace.name}`,
+    `当前会话工作目录：${workspace.cwd}`,
     `当前会话 Codex session：${sessionForChat(chatId) || '未创建'}`,
     conversationStatusText(),
   ].join('\n');
@@ -1028,10 +1188,10 @@ function compactTail(text, max) {
   return cleaned.length > max ? `...\n${cleaned.slice(-max)}` : cleaned;
 }
 
-function buildPromptWithMemory(chatId, prompt, useMemory) {
+function buildPromptWithMemory(chatId, prompt, useMemory, workspaceName = workspaceForChat(chatId).name) {
   if (!config.memoryEnabled) return prompt;
   if (!useMemory) return prompt;
-  const conversation = loadConversation(chatId);
+  const conversation = loadConversation(chatId, workspaceName);
   const turns = (conversation.turns || []).slice(-Math.max(1, config.memoryContextTurns));
   if (!turns.length) return prompt;
 
@@ -1050,9 +1210,9 @@ function buildPromptWithMemory(chatId, prompt, useMemory) {
   return trimFromStart(lines.join('\n'), config.memoryMaxChars + prompt.length + 1000);
 }
 
-function appendConversationTurn(chatId, userPrompt, assistantMessage) {
+function appendConversationTurn(chatId, userPrompt, assistantMessage, workspaceName = workspaceForChat(chatId).name) {
   if (!config.memoryEnabled) return;
-  const conversation = loadConversation(chatId);
+  const conversation = loadConversation(chatId, workspaceName);
   const turns = Array.isArray(conversation.turns) ? conversation.turns : [];
   turns.push({
     at: new Date().toISOString(),
@@ -1061,9 +1221,10 @@ function appendConversationTurn(chatId, userPrompt, assistantMessage) {
   });
 
   conversation.chatId = chatId;
+  conversation.workspaceName = workspaceName;
   conversation.updatedAt = new Date().toISOString();
   conversation.turns = trimConversation(turns);
-  saveConversation(chatId, conversation);
+  saveConversation(chatId, conversation, workspaceName);
 }
 
 function trimConversation(turns) {
@@ -1074,45 +1235,38 @@ function trimConversation(turns) {
   return kept;
 }
 
-function loadConversation(chatId) {
+function loadConversation(chatId, workspaceName = workspaceForChat(chatId).name) {
   try {
-    const parsed = JSON.parse(fs.readFileSync(conversationPath(chatId), 'utf8'));
+    const parsed = JSON.parse(fs.readFileSync(conversationPath(chatId, workspaceName), 'utf8'));
     return parsed && typeof parsed === 'object' ? parsed : { turns: [] };
   } catch {
     return { turns: [] };
   }
 }
 
-function saveConversation(chatId, conversation) {
+function saveConversation(chatId, conversation, workspaceName = workspaceForChat(chatId).name) {
   try {
-    fs.writeFileSync(conversationPath(chatId), `${JSON.stringify(conversation, null, 2)}\n`);
+    fs.writeFileSync(conversationPath(chatId, workspaceName), `${JSON.stringify(conversation, null, 2)}\n`);
   } catch (err) {
     log(`conversation save failed chat=${chatId}: ${err.stack || err.message || err}`);
   }
 }
 
-function resetConversation(chatId) {
+function resetConversation(chatId, workspaceName = workspaceForChat(chatId).name) {
   try {
-    fs.rmSync(conversationPath(chatId), { force: true });
+    fs.rmSync(conversationPath(chatId, workspaceName), { force: true });
   } catch (err) {
     log(`conversation reset failed chat=${chatId}: ${err.stack || err.message || err}`);
   }
 }
 
 function cwdForChat(chatId) {
-  const workspaces = loadWorkspaces();
-  const cwd = workspaces.chats && workspaces.chats[chatId] && workspaces.chats[chatId].cwd;
-  return cwd || config.codexCwd;
+  return workspaceForChat(chatId).cwd;
 }
 
 function setChatCwd(chatId, cwd) {
-  const workspaces = loadWorkspaces();
-  workspaces.chats = workspaces.chats && typeof workspaces.chats === 'object' ? workspaces.chats : {};
-  workspaces.chats[chatId] = {
-    cwd,
-    updatedAt: new Date().toISOString(),
-  };
-  saveWorkspaces(workspaces);
+  const state = workspaceStateForChat(chatId);
+  setNamedWorkspace(chatId, state.current, cwd, true);
 }
 
 function loadWorkspaces() {
@@ -1122,6 +1276,89 @@ function loadWorkspaces() {
   } catch {
     return { chats: {} };
   }
+}
+
+function workspaceForChat(chatId) {
+  const state = workspaceStateForChat(chatId);
+  return {
+    name: state.current,
+    cwd: state.items[state.current] && state.items[state.current].cwd ? state.items[state.current].cwd : config.codexCwd,
+  };
+}
+
+function workspaceStateForChat(chatId) {
+  const workspaces = loadWorkspaces();
+  const raw = workspaces.chats && workspaces.chats[chatId] && typeof workspaces.chats[chatId] === 'object'
+    ? workspaces.chats[chatId]
+    : {};
+  const items = raw.items && typeof raw.items === 'object' ? raw.items : {};
+
+  if (raw.cwd && !items.default) {
+    items.default = { cwd: raw.cwd, updatedAt: raw.updatedAt || new Date().toISOString() };
+  }
+  if (!items.default) {
+    items.default = { cwd: config.codexCwd, updatedAt: new Date().toISOString() };
+  }
+
+  const current = items[raw.current] ? raw.current : 'default';
+  return { current, items };
+}
+
+function namedWorkspaceForChat(chatId, name) {
+  const state = workspaceStateForChat(chatId);
+  return state.items[normalizeWorkspaceName(name)] || null;
+}
+
+function setNamedWorkspace(chatId, name, cwd, makeCurrent) {
+  const workspaceName = normalizeWorkspaceName(name) || 'default';
+  const workspaces = loadWorkspaces();
+  const state = workspaceStateForChat(chatId);
+  state.items[workspaceName] = {
+    cwd,
+    updatedAt: new Date().toISOString(),
+  };
+  workspaces.chats = workspaces.chats && typeof workspaces.chats === 'object' ? workspaces.chats : {};
+  workspaces.chats[chatId] = {
+    current: makeCurrent ? workspaceName : state.current,
+    items: state.items,
+    updatedAt: new Date().toISOString(),
+  };
+  saveWorkspaces(workspaces);
+}
+
+function setCurrentWorkspace(chatId, name) {
+  const workspaceName = normalizeWorkspaceName(name);
+  const workspaces = loadWorkspaces();
+  const state = workspaceStateForChat(chatId);
+  if (!state.items[workspaceName]) return false;
+  workspaces.chats = workspaces.chats && typeof workspaces.chats === 'object' ? workspaces.chats : {};
+  workspaces.chats[chatId] = {
+    current: workspaceName,
+    items: state.items,
+    updatedAt: new Date().toISOString(),
+  };
+  saveWorkspaces(workspaces);
+  return true;
+}
+
+function deleteNamedWorkspace(chatId, name) {
+  const workspaceName = normalizeWorkspaceName(name);
+  const workspaces = loadWorkspaces();
+  const state = workspaceStateForChat(chatId);
+  if (!workspaceName || workspaceName === 'default' || !state.items[workspaceName]) return false;
+  delete state.items[workspaceName];
+  workspaces.chats = workspaces.chats && typeof workspaces.chats === 'object' ? workspaces.chats : {};
+  workspaces.chats[chatId] = {
+    current: state.current === workspaceName ? 'default' : state.current,
+    items: state.items,
+    updatedAt: new Date().toISOString(),
+  };
+  saveWorkspaces(workspaces);
+  return true;
+}
+
+function normalizeWorkspaceName(name) {
+  return String(name || '').trim().replace(/[^a-zA-Z0-9_.-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
 }
 
 function saveWorkspaces(workspaces) {
@@ -1135,30 +1372,64 @@ function saveWorkspaces(workspaces) {
   }
 }
 
-function sessionForChat(chatId) {
+function sessionForChat(chatId, workspaceName = workspaceForChat(chatId).name) {
   if (!config.codexSessionsEnabled) return '';
   const sessions = loadSessions();
-  const session = sessions.chats && sessions.chats[chatId];
+  const chat = sessions.chats && sessions.chats[chatId];
+  const session = sessionEntryForWorkspace(chat, workspaceName);
   return session && session.sessionId ? session.sessionId : '';
 }
 
-function setChatSession(chatId, sessionId, cwd, taskId) {
+function setChatSession(chatId, sessionId, cwd, taskId, workspaceName = workspaceForChat(chatId).name) {
   const sessions = loadSessions();
+  const normalized = normalizeWorkspaceName(workspaceName) || 'default';
+  const existing = sessions.chats && sessions.chats[chatId];
   sessions.chats = sessions.chats && typeof sessions.chats === 'object' ? sessions.chats : {};
-  sessions.chats[chatId] = {
+  const workspaces = existing && existing.workspaces && typeof existing.workspaces === 'object'
+    ? existing.workspaces
+    : {};
+  if (existing && existing.sessionId && !workspaces.default) {
+    workspaces.default = {
+      sessionId: existing.sessionId,
+      cwd: existing.cwd,
+      taskId: existing.taskId,
+      updatedAt: existing.updatedAt,
+    };
+  }
+  workspaces[normalized] = {
     sessionId,
     cwd,
     taskId,
     updatedAt: new Date().toISOString(),
   };
+  sessions.chats[chatId] = {
+    workspaces,
+    updatedAt: new Date().toISOString(),
+  };
   saveSessions(sessions);
 }
 
-function clearChatSession(chatId) {
+function clearChatSession(chatId, workspaceName = workspaceForChat(chatId).name) {
   const sessions = loadSessions();
   if (!sessions.chats || !sessions.chats[chatId]) return;
-  delete sessions.chats[chatId];
+  const normalized = normalizeWorkspaceName(workspaceName) || 'default';
+  const chat = sessions.chats[chatId];
+  if (chat.workspaces && typeof chat.workspaces === 'object') {
+    delete chat.workspaces[normalized];
+    chat.updatedAt = new Date().toISOString();
+    if (!Object.keys(chat.workspaces).length) delete sessions.chats[chatId];
+  } else {
+    delete sessions.chats[chatId];
+  }
   saveSessions(sessions);
+}
+
+function sessionEntryForWorkspace(chat, workspaceName) {
+  if (!chat || typeof chat !== 'object') return null;
+  const normalized = normalizeWorkspaceName(workspaceName) || 'default';
+  if (chat.workspaces && typeof chat.workspaces === 'object') return chat.workspaces[normalized] || null;
+  if (normalized === 'default' && chat.sessionId) return chat;
+  return null;
 }
 
 function loadSessions() {
@@ -1181,8 +1452,11 @@ function saveSessions(sessions) {
   }
 }
 
-function conversationPath(chatId) {
-  return path.join(CONVERSATION_DIR, `${safeFileToken(chatId)}.json`);
+function conversationPath(chatId, workspaceName = 'default') {
+  const workspaceToken = normalizeWorkspaceName(workspaceName) || 'default';
+  const chatToken = safeFileToken(chatId);
+  if (workspaceToken === 'default') return path.join(CONVERSATION_DIR, `${chatToken}.json`);
+  return path.join(CONVERSATION_DIR, `${chatToken}__${workspaceToken}.json`);
 }
 
 function safeFileToken(value) {
