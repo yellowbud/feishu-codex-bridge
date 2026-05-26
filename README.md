@@ -53,90 +53,94 @@ tail -f logs/bridge.log
 
 ## 飞书里怎么用
 
-私聊或已授权群里直接发需求：
+私聊或已授权群里，直接发需求即可：
 
 ```text
 帮我检查这个项目
 ```
 
-也可以直接发送图片或文件。机器人会先下载到本机 `data/attachments/`，再把本机路径交给 Codex 读取。
+你也可以直接发图片或文件。机器人会先下载到本机 `data/attachments/`，再把本机路径交给 Codex 读取。
 
-看到别人发的消息，也可以一键转给 Codex：给那条消息点机器人表情 reaction，机器人会读取原消息并在同一个 thread 里处理。默认监听的 emoji 类型在 `.env` 的 `FEISHU_CODEX_REACTION_EMOJIS` 配置。
+看到别人发的消息，可以给那条消息点机器人表情 reaction，一键转给 Codex 处理。默认监听的 emoji 类型在 `.env` 的 `FEISHU_CODEX_REACTION_EMOJIS` 里配置。
 
-所有可见对话都会留在飞书里：用户原消息、任务开始卡片、实际交给 Codex 的输入摘要、最终回复、飞书文档、表格卡片和附件都会回写到同一个 thread，方便搜索、存档、回顾和转发。`data/` 里的 session、workspace、附件和 memory 文件只是本机运行缓存，不作为主要记录。
+所有聊天记录都留在飞书 thread 里：原消息、任务开始卡片、输入摘要、最终回复、表格卡片、飞书文档和附件都会回写，方便搜索、存档、回顾和分享。`data/` 只是本机运行缓存。
 
-Codex 也可以发回多媒体：如果最终回复里出现本机图片或文件路径，桥接会自动上传到飞书。例如 Codex 生成 `report.pdf`、`chart.png`、截图或压缩包后，只要在回复里写出绝对路径或 Markdown 链接，就会作为附件发回。
+Codex 不只会发纯文字。它可以把本机生成的图片、PDF、截图、压缩包等文件上传回飞书；也可以创建飞书文档、渲染表格、发送可点击按钮卡片。
 
-长文档会自动变成飞书文档：当你让 Codex 写 specs、docs、PRD、设计方案或长说明时，它可以创建飞书文档并发回打开按钮，大家可以直接在文档里评论反馈。
+### 会话
 
-还支持更像飞书原生的富文本：
+| 命令 | 作用 |
+| --- | --- |
+| `/new` 或 `/reset` | 清空当前 thread 的 Codex session，从零开始 |
+| `/new <任务>` | 开新 session 并立刻执行任务 |
+| `/new chat <名字>` | 自动创建新 project 群，并继承当前 cwd |
+| `/resume [N]` | 列出最近 N 个历史 session，点按钮恢复 |
+| `/status` | 查看当前 cwd、workspace、session 和运行状态 |
+| `/help` | 查看命令速查卡片 |
 
-```text
-请给我一个表格，用 feishu-table 渲染
-写一份项目 spec，创建成飞书文档
-请生成一张长图，保存成 png 并发给我
-给我一个带按钮的飞书交互卡片
+一个群就是一个 project。话题群里的每个话题、普通群里的每个 thread，都是独立 Codex session。
+
+### 工作目录
+
+| 命令 | 作用 |
+| --- | --- |
+| `/cd <路径>` | 切换当前会话的 cwd，并重置 session |
+| `/ws list` | 查看所有命名 workspace |
+| `/ws save <名字>` | 把当前 cwd 保存成 workspace |
+| `/ws use <名字>` | 切到指定 workspace |
+| `/ws remove <名字>` | 删除 workspace |
+
+每个 workspace 都有自己的 Codex session，切回来会接着之前的上下文。
+
+### 运行控制
+
+| 命令 | 作用 |
+| --- | --- |
+| `/stop` | 终止当前 thread 正在跑的任务 |
+| `/cancel <taskId>` | 按任务 ID 取消 |
+| `/timeout` | 查看当前 session 的 run 探活 |
+| `/timeout 15` | 15 分钟无输出自动 kill |
+| `/timeout off` | 当前 session 关闭探活 |
+| `/timeout default` | 清掉 session 覆盖，跟随全局 |
+| `/reconnect` | 强制重连 Feishu WebSocket |
+
+任务开始卡片底部的 `⏹ 终止` 按钮等同于 `/stop`。
+
+### 设置与诊断
+
+| 命令 | 作用 |
+| --- | --- |
+| `/config` | 打开偏好设置卡片 |
+| `/account` | 查看当前绑定的飞书应用 |
+| `/account change <appId> <appSecret>` | 热切换应用凭据 |
+| `/ps` | 列出本机 bridge 进程，并标出当前回复进程 |
+| `/exit #1` 或 `/exit <pid>` | 终止指定 bridge 进程 |
+| `/doctor [描述]` | 用最近日志生成故障诊断 |
+
+`/config` 可调整回复方式、工具调用显示、并发上限、群里是否必须 @ bot。`/account change` 建议在私聊里执行，避免 secret 留在群记录里。`/exit` 只会终止 `/ps` 识别出的 bridge 进程；关当前进程会 graceful 退出，关其他 bridge 进程会发 SIGTERM。
+
+### 飞书原生输出
+
+让 Codex 输出这些代码块，桥接会自动渲染成飞书内容：
+
+````text
+```feishu-doc title="项目 spec"
+# 标题
+...
 ```
 
-常用命令：
-
-```text
-/help
-/status
-/config
-/timeout
-/timeout 15
-/timeout off
-/timeout default
-/reconnect
-/account
-/account change <appId> <appSecret>
-/ps
-/exit #1
-/doctor bot 没回复
-/new
-/new chat 新项目名字
-/resume 5
-/stop
-/cancel <taskId>
-/cd /Users/macmini/some-project
-/ws list
-/ws save bridge
-/ws use bridge
-/ws remove bridge
+```feishu-table title="数据表"
+| 名称 | 状态 |
+| --- | --- |
+| A | done |
 ```
 
-说明：
+```feishu-actions
+{"title":"选择下一步","actions":[{"label":"继续","prompt":"继续处理"}]}
+```
+````
 
-- 一个群就是一个 project。
-- 群里的每个话题/thread 都是一个独立 Codex session。
-- `/cd` 切换当前飞书会话的工作目录。
-- 机器人会在线程里回复；普通群里直接发一条新消息，会形成一个新的 thread/session。
-- `/new chat <名字>` 自动创建一个新项目群，并把你拉进去；新群会继承当前 cwd，但从新会话开始。
-- `/resume [N]` 列出最近 N 个历史 Codex session，点按钮恢复到当前 thread。
-- `/config` 打开偏好设置卡片，可调整消息回复方式、工具调用显示、并发上限、群内是否需要 @ bot。
-- `/timeout` 查看当前 session 的 run 探活设置；`/timeout 15` 表示 15 分钟无输出自动 kill；`/timeout off` 关闭；`/timeout default` 跟随全局默认。
-- `/stop` 终止当前 thread 正在跑的任务；任务开始卡片底部的 `⏹ 终止` 按钮等同于 `/stop`。
-- `/reconnect` 强制重连 Feishu WebSocket，适合网络抖动后 bot 没反应时使用。
-- `/account` 查看或切换当前绑定的 bot；`/account change <appId> <appSecret>` 更新 `.env` 并热重连。建议在私聊里执行，避免 secret 留在群记录里。
-- `/ps` 列出本机 bridge 进程，并标出当前正在回复这个群消息的进程。
-- `/exit #1` 或 `/exit <pid>` 终止指定 bridge 进程；关当前进程会先 graceful 退出，关其他 bridge 进程会发 SIGTERM。
-- `/doctor [描述]` 把最近 bridge 日志和故障描述交给 Codex 做自助诊断，返回可能原因、关键日志和下一步建议。
-- `/cd <路径>` 切换当前 cwd，并重置当前 project/session。
-- `/ws list` 列出所有命名 workspace，并显示按钮一键切换。
-- `/ws save <名字>` 把当前 cwd 保存成命名 workspace，并为该 workspace 开新 session。
-- `/ws use <名字>` 切到指定命名 workspace。
-- `/ws remove <名字>` 删除命名 workspace。
-- 每个 workspace 都有自己的 Codex session，切回来会接着之前的上下文。
-- 图片和文件消息也会使用当前 workspace 与当前 Codex session。
-- 给任意消息添加配置里的 reaction emoji，会把那条消息一键转给 Codex 处理。
-- 每个任务都会在开始卡片里记录“输入归档”，所以按钮、reaction、附件等非手打指令也能在飞书里检索和回顾。
-- Codex 生成的本机图片/文件会自动作为飞书附件发送，默认只允许当前 workspace、`CODEX_CWD`、`data/` 和 `/private/tmp` 下的文件。
-- Codex 可以输出 `feishu-doc` 代码块创建飞书文档，适合 specs/docs/PRD/设计文档，方便在飞书里阅读和评论。
-- Codex 可以输出 `feishu-table` 代码块渲染表格，输出 `feishu-actions` 代码块生成按钮卡片；按钮点击会自动作为同一 session 的下一条指令执行。
-- `/new` 清空当前飞书会话的 Codex session，开启全新任务。
-- `/new <任务>` 开新 session 并立刻执行这个任务。
-- `/cd` 会更新当前 workspace 的目录，并同时开启新 session。
+Codex 生成本机图片或文件后，只要在最终回复里写出绝对路径或 Markdown 链接，桥接会自动上传为飞书附件。默认只允许当前 workspace、`CODEX_CWD`、`data/` 和 `/private/tmp` 下的文件。
 
 ## 访问控制
 
