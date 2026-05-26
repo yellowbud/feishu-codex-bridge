@@ -44,9 +44,10 @@ tail -f logs/bridge.log
 6. 需要直接发送图片/文件时，开启权限：`获取消息中的资源文件`。
 7. 需要 Codex 发回图片/文件时，开启上传图片、上传文件、发送图片/文件消息相关权限。
 8. 需要 Codex 创建 specs/docs 飞书文档时，开启创建、编辑新版云文档（docx）相关权限。
-9. 需要可交互卡片按钮时，订阅卡片回调事件：`card.action.trigger`。
-10. 需要 `/new chat` 自动建群时，开启创建群与拉用户入群相关权限。
-11. 改权限后重新发布应用版本，并把机器人加入目标群。
+9. 需要给任意消息点表情后一键转给 Codex 时，订阅事件：`im.message.reaction.created_v1`，并开启获取指定消息内容相关权限。
+10. 需要可交互卡片按钮时，订阅卡片回调事件：`card.action.trigger`。
+11. 需要 `/new chat` 自动建群时，开启创建群与拉用户入群相关权限。
+12. 改权限后重新发布应用版本，并把机器人加入目标群。
 
 如果没有 `im:message.group_msg`，飞书通常只会把 `@机器人` 的群消息投递给应用。
 
@@ -59,6 +60,8 @@ tail -f logs/bridge.log
 ```
 
 也可以直接发送图片或文件。机器人会先下载到本机 `data/attachments/`，再把本机路径交给 Codex 读取。
+
+看到别人发的消息，也可以一键转给 Codex：给那条消息点机器人表情 reaction，机器人会读取原消息并在同一个 thread 里处理。默认监听的 emoji 类型在 `.env` 的 `FEISHU_CODEX_REACTION_EMOJIS` 配置。
 
 Codex 也可以发回多媒体：如果最终回复里出现本机图片或文件路径，桥接会自动上传到飞书。例如 Codex 生成 `report.pdf`、`chart.png`、截图或压缩包后，只要在回复里写出绝对路径或 Markdown 链接，就会作为附件发回。
 
@@ -99,6 +102,7 @@ Codex 也可以发回多媒体：如果最终回复里出现本机图片或文�
 - `/ws <name>` 在同一个飞书会话里切换 workspace。
 - 每个 workspace 都有自己的 Codex session，切回来会接着之前的上下文。
 - 图片和文件消息也会使用当前 workspace 与当前 Codex session。
+- 给任意消息添加配置里的 reaction emoji，会把那条消息一键转给 Codex 处理。
 - Codex 生成的本机图片/文件会自动作为飞书附件发送，默认只允许当前 workspace、`CODEX_CWD`、`data/` 和 `/private/tmp` 下的文件。
 - Codex 可以输出 `feishu-doc` 代码块创建飞书文档，适合 specs/docs/PRD/设计文档，方便在飞书里阅读和评论。
 - Codex 可以输出 `feishu-table` 代码块渲染表格，输出 `feishu-actions` 代码块生成按钮卡片；按钮点击会自动作为同一 session 的下一条指令执行。

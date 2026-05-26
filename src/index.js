@@ -52,6 +52,7 @@ const config = {
   outboundMediaDirs: splitList(process.env.FEISHU_OUTBOUND_MEDIA_DIRS),
   feishuDocFolderToken: process.env.FEISHU_DOC_FOLDER_TOKEN || '',
   feishuDocBaseUrl: process.env.FEISHU_DOC_BASE_URL || 'https://www.feishu.cn/docx',
+  codexReactionEmojis: splitList(process.env.FEISHU_CODEX_REACTION_EMOJIS || 'RobotFace,robot_face,ROBOT_FACE'),
 };
 
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
@@ -79,6 +80,7 @@ const wsClient = new Lark.WSClient({
 });
 
 const running = new Map();
+const handledReactionEvents = new Set();
 let taskSeq = 0;
 
 const dispatcher = new Lark.EventDispatcher({
@@ -96,6 +98,13 @@ const dispatcher = new Lark.EventDispatcher({
     setImmediate(() => {
       handleCardAction(data).catch((err) => {
         log(`card action handler error: ${err.stack || err.message || err}`);
+      });
+    });
+  },
+  'im.message.reaction.created_v1': (data) => {
+    setImmediate(() => {
+      handleReactionCreated(data).catch((err) => {
+        log(`reaction handler error: ${err.stack || err.message || err}`);
       });
     });
   },
@@ -231,6 +240,124 @@ async function handleCardAction(data) {
     memoryReason: 'card-action',
     resetSession: false,
   });
+}
+
+async function handleReactionCreated(data) {
+  const emoji = data && data.reaction_type && data.reaction_type.emoji_type;
+  const messageId = data && data.message_id;
+  const operatorId = data && data.user_id && (data.user_id.open_id || data.user_id.user_id);
+  const dedupeKey = `${data && (data.event_id || data.uuid || '')}:${messageId}:${operatorId}:${emoji}`;
+  if (!messageId || !operatorId || !emoji) return;
+  if (handledReactionEvents.has(dedupeKey)) return;
+  rememberReactionEvent(dedupeKey);
+
+  if (!config.codexReactionEmojis.includes(emoji)) {
+    log(`ignored reaction emoji=${emoji} message=${messageId}`);
+    return;
+  }
+
+  const message = await fetchMessage(messageId);
+  if (!message || message.deleted) {
+    log(`reaction target message unavailable message=${messageId}`);
+    return;
+  }
+  const chatId = message.chat_id;
+  if (!chatId) return;
+  if (config.allowedChatIds.length && !config.allowedChatIds.includes(chatId)) {
+    log(`ignored reaction from unauthorized chat ${chatId}`);
+    return;
+  }
+  const gateResult = gateAction({ chatId, senderId: operatorId, chatType: message.chat_type || 'group' });
+  if (gateResult.action !== 'deliver') {
+    log(`reaction access drop chat=${chatId} sender=${operatorId} emoji=${emoji}`);
+    return;
+  }
+
+  const context = messageContext(message);
+  const text = extractText(message);
+  const attachments = extractAttachments(message);
+  log(`reaction forwarded message=${messageId} chat=${chatId} context=${context.contextId} sender=${operatorId} emoji=${emoji} attachments=${attachments.length} text=${singleLine(text).slice(0, 120)}`);
+
+  if (!text && !attachments.length) {
+    await sendUiMessage(chatId, {
+      kind: 'warn',
+      title: '这条消息无法转给 Codex',
+      template: 'orange',
+      summary: '没有读取到文本、图片或文件内容。',
+    }, messageId);
+    return;
+  }
+
+  if (attachments.length) {
+    await handleAttachmentMessage({
+      chatId,
+      messageId,
+      senderId: operatorId,
+      context,
+      text: buildForwardedMessagePrompt(message, text, ''),
+      message,
+      attachments,
+    });
+    return;
+  }
+
+  const prompt = buildForwardedMessagePrompt(message, text, '请处理这条飞书消息，并直接给出结果。');
+  await startCodexTask(prompt, {
+    chatId,
+    messageId,
+    senderId: operatorId,
+    contextId: context.contextId,
+    contextLabel: context.label,
+    useMemory: true,
+    memoryReason: 'reaction-forward',
+    resetSession: false,
+  });
+}
+
+function rememberReactionEvent(key) {
+  handledReactionEvents.add(key);
+  if (handledReactionEvents.size > 500) {
+    const [first] = handledReactionEvents;
+    handledReactionEvents.delete(first);
+  }
+}
+
+async function fetchMessage(messageId) {
+  const response = await client.im.message.get({
+    path: { message_id: messageId },
+    params: { user_id_type: 'open_id' },
+  });
+  const item = response && response.data && Array.isArray(response.data.items) ? response.data.items[0] : null;
+  if (!item) return null;
+  return {
+    message_id: item.message_id || messageId,
+    root_id: item.root_id,
+    parent_id: item.parent_id,
+    thread_id: item.thread_id,
+    chat_id: item.chat_id,
+    chat_type: item.chat_type || 'group',
+    message_type: item.msg_type,
+    content: item.body && item.body.content || '{}',
+    mentions: item.mentions || [],
+    deleted: item.deleted,
+    sender: item.sender,
+    message_app_link: item.message_app_link,
+  };
+}
+
+function buildForwardedMessagePrompt(message, text, instruction) {
+  const sender = message.sender && (message.sender.sender_name || message.sender.id) || 'unknown';
+  const lines = [
+    '用户在飞书里一键转发了下面这条消息给 Codex。',
+    instruction ? `用户意图：${instruction}` : null,
+    '',
+    `原消息发送者：${sender}`,
+    message.message_app_link ? `原消息链接：${message.message_app_link}` : null,
+    '',
+    '原消息内容：',
+    String(text || '').trim() || '(无文本内容)',
+  ].filter(Boolean);
+  return lines.join('\n');
 }
 
 function normalizeRawCardAction(data) {
@@ -751,6 +878,23 @@ function gateMessage(input) {
   if ((policy.requireMention ?? true) && !isMentioned(input.text, access.mentionPatterns, input.mentions)) {
     return { action: 'drop' };
   }
+  return { action: 'deliver' };
+}
+
+function gateAction(input) {
+  if (!config.accessEnabled) return { action: 'deliver' };
+  const access = readAccessFile();
+  if (pruneExpired(access)) saveAccess(access);
+  if (access.dmPolicy === 'disabled') return { action: 'drop' };
+  if (config.allowedChatIds.includes(input.chatId)) return { action: 'deliver' };
+  if (!isGroupChat(input.chatType)) {
+    if (access.allowFrom.includes(input.senderId)) return { action: 'deliver' };
+    return { action: 'drop' };
+  }
+  const policy = access.groups[input.chatId];
+  if (!policy) return { action: 'drop' };
+  const groupAllowFrom = Array.isArray(policy.allowFrom) ? policy.allowFrom : [];
+  if (groupAllowFrom.length && !groupAllowFrom.includes(input.senderId)) return { action: 'drop' };
   return { action: 'deliver' };
 }
 
@@ -1459,6 +1603,7 @@ async function sendHelp(chatId, replyToMessageId) {
     '`/cd <目录>` 切换当前飞书会话的工作目录',
     '`/ws` 查看 workspace；`/ws add <name> <目录>` 添加；`/ws <name>` 切换',
     '直接发送需求、图片或文件即可执行任务；已授权群聊无需 @机器人。',
+    `给任意消息添加 ${config.codexReactionEmojis[0] || '配置的'} reaction，可一键转给 Codex 处理。`,
   ];
   const workspace = workspaceForChat(chatId);
   await sendCard(chatId, {
