@@ -1,179 +1,135 @@
 # Feishu Codex Bridge
 
-Local long-connection bridge between a Feishu bot and the local Codex CLI.
+把飞书机器人接到本机 Codex CLI。你在飞书里发消息，macmini 上的 Codex 执行任务，再把结果发回飞书。
 
-## Configure
+## 快速开始
 
 ```bash
-cd /Users/macmini/feishu-codex-bridge
+git clone https://github.com/yellowbud/feishu-codex-bridge.git
+cd feishu-codex-bridge
+npm install
 cp .env.example .env
 ```
 
-Fill:
+编辑 `.env`，至少填写：
 
-- `FEISHU_APP_ID`
-- `FEISHU_APP_SECRET`
+```env
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+```
 
-In Feishu Open Platform, use a self-built app, enable Bot, subscribe to `im.message.receive_v1`, and use long-connection mode.
-
-## Run
+启动：
 
 ```bash
 npm start
 ```
 
-Send in Feishu:
+保持后台在线：
+
+```bash
+npm run install-service
+npm run service-status
+tail -f logs/bridge.log
+```
+
+## 飞书配置
+
+在飞书开放平台创建企业自建应用：
+
+1. 启用「机器人」。
+2. 使用「长连接」事件模式。
+3. 订阅事件：`im.message.receive_v1`。
+4. 私聊消息需要机器人消息权限。
+5. 群里不 `@机器人` 也要收到消息时，开启权限：`获取群组中所有消息` / `im:message.group_msg`。
+6. 改权限后重新发布应用版本，并把机器人加入目标群。
+
+如果没有 `im:message.group_msg`，飞书通常只会把 `@机器人` 的群消息投递给应用。
+
+## 飞书里怎么用
+
+私聊或已授权群里直接发需求：
+
+```text
+帮我检查这个项目
+```
+
+常用命令：
 
 ```text
 /help
 /status
-Reply with exactly OK
 /new
 /stop
 /cancel <taskId>
 /cd /Users/macmini/some-project
 ```
 
-When `FEISHU_REQUIRE_PREFIX=0`, direct messages and authorized group messages
-are treated as Codex tasks. The `/codex ...` prefix remains accepted for
-compatibility.
+说明：
 
-## Access Control
+- `/cd` 切换当前飞书会话的工作目录。
+- `/new` 清空当前会话上下文。
+- 默认每条消息都是新任务，不会自动串到旧任务。
+- 要继续上一件事，用 `继续 ...`、`接着 ...`、`基于上文 ...` 开头。
 
-The bridge now mirrors the Claude IM channel access model. Runtime access state
-lives in `data/access.json` and is re-read for every inbound message:
+## 访问控制
 
-```json
-{
-  "dmPolicy": "pairing",
-  "allowFrom": [],
-  "groups": {},
-  "pending": {},
-  "mentionPatterns": ["@Codex"]
-}
-```
+默认开启访问控制，状态保存在 `data/access.json`，不会提交到 Git。
 
-DM policy can be `pairing`, `allowlist`, or `disabled`. In pairing mode, a new
-DM receives a short code; approve it locally:
+新私聊用户会收到配对码，在本机批准：
 
 ```bash
 npm run access -- pair <code>
-npm run access -- policy allowlist
 ```
 
-Manage access locally:
+常用管理命令：
 
 ```bash
 npm run access
 npm run access -- allow <senderOpenId>
 npm run access -- remove <senderOpenId>
+npm run access -- group add <chatId> --no-mention
 npm run access -- group add <chatId> --allow=<senderOpenId>
-npm run access -- group add <chatId> --no-mention
-npm run access -- set textChunkLimit 3000
-npm run access -- set chunkMode newline
-npm run access -- set mentionPatterns '["@Codex","/codex"]'
 ```
 
-Do not approve pairings from a Feishu message request. Pairing and allowlist
-changes must be typed locally because channel messages are untrusted input.
+不要在飞书消息里执行配对批准；批准动作只应该在本机终端执行。
 
-In group chats, disable mention requirement when every message in that group is
-intended for Codex:
+## 安全说明
+
+`.env` 里有飞书密钥，不要提交。仓库已默认忽略：
 
 ```text
-npm run access -- group add <chatId> --no-mention
+.env
+data/
+logs/
+node_modules/
 ```
 
-If a Feishu group only delivers events to mentioned bots, then Feishu itself may
-still require `@YourBot` before the bridge receives the message.
-
-To receive normal group messages without `@YourBot`, the self-built app must
-have the all-group-message permission enabled in Feishu Open Platform:
-
-- Event subscription: `im.message.receive_v1`
-- Permission: 获取群组中所有消息 / `im:message.group_msg`
-- Re-publish the self-built app version after changing permissions
-- Make sure the bot is in the target group
-
-Without `im:message.group_msg`, Feishu usually only delivers group messages
-that mention the bot, even if this bridge has `requireMention=false`.
-
-`FEISHU_WEBHOOK_URL` can mirror bridge output to a custom webhook bot in a
-group, but a webhook bot cannot receive commands. Commands must still be sent
-to the self-built app bot that owns `FEISHU_APP_ID` / `FEISHU_APP_SECRET`.
-
-## Conversation Memory
-
-The bridge keeps per-chat context in `data/conversations/<chat_id>.json`.
-Successful Codex runs append the user command and the final Codex response, and
-the next command in the same Feishu chat can explicitly request that history.
-
-Configure with:
-
-```env
-FEISHU_MEMORY_ENABLED=1
-FEISHU_MEMORY_MODE=explicit
-FEISHU_MEMORY_MAX_TURNS=200
-FEISHU_MEMORY_CONTEXT_TURNS=3
-FEISHU_MEMORY_MAX_CHARS=240000
-```
-
-默认 `FEISHU_MEMORY_MODE=explicit`：每条消息都按新任务处理，不会自动带入旧任务上下文。
-需要继续上一件事时，用下面这类开头：
-
-```text
-继续 ...
-接着 ...
-基于上文 ...
-根据以上 ...
-```
-
-强制忽略历史上下文：
-
-```text
-新任务：...
-不要带上下文 ...
-```
-
-Clear the current Feishu chat memory:
-
-```text
-/new
-```
-
-## Per-Chat Workspace
-
-Each Feishu chat can keep its own Codex working directory in
-`data/workspaces.json`. Switch it from Feishu:
-
-```text
-/cd /Users/macmini/your-project
-```
-
-Switching directories stops any running task in that chat and clears that
-chat's memory, so a new project does not inherit unrelated old context.
-
-## Codex Permissions
-
-The bridge runs Codex with:
+如果 `.env` 里启用了：
 
 ```env
 CODEX_EXTRA_ARGS=--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox
 ```
 
-This persists full Codex CLI execution permission for tasks launched from the
-Feishu bot. macOS privacy permissions such as Full Disk Access still have to be
-granted by the operating system.
+飞书发来的任务会以本机 Codex 权限执行。只把机器人加到可信群，并限制可用用户。
 
-## Keep Online
+## 常见问题
+
+群里不 `@` 没反应：
+
+- 确认群已授权：`npm run access`
+- 确认群策略是 `requireMention=false`
+- 确认飞书应用有 `im:message.group_msg`
+- 确认重新发布了应用版本
+- 看日志是否出现 `message received`
+
+查看服务状态：
 
 ```bash
-npm run install-service
 npm run service-status
 tail -f logs/bridge.log logs/launchd.err.log
 ```
 
-Stop:
+停止后台服务：
 
 ```bash
 npm run uninstall-service
