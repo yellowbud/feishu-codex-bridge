@@ -84,6 +84,12 @@ Codex 也可以发回多媒体：如果最终回复里出现本机图片或文�
 /help
 /status
 /config
+/timeout
+/timeout 15
+/timeout off
+/timeout default
+/account
+/account change <appId> <appSecret>
 /new
 /new chat 新项目名字
 /stop
@@ -102,6 +108,8 @@ Codex 也可以发回多媒体：如果最终回复里出现本机图片或文�
 - 机器人会在线程里回复；普通群里直接发一条新消息，会形成一个新的 thread/session。
 - `/new chat <名字>` 自动创建一个新项目群，并把你拉进去。
 - `/config` 打开偏好设置卡片，可调整消息回复方式、工具调用显示、并发上限、群内是否需要 @ bot。
+- `/timeout` 查看当前 session 的 run 探活设置；`/timeout 15` 表示 15 分钟无输出自动 kill；`/timeout off` 关闭；`/timeout default` 跟随全局默认。
+- `/account` 查看当前飞书应用；`/account change <appId> <appSecret>` 更新 `.env` 并热重连。建议在私聊里执行，避免 secret 留在群记录里。
 - `/ws add <name> <目录>` 添加命名 workspace。
 - `/ws <name>` 在同一个飞书会话里切换 workspace。
 - 每个 workspace 都有自己的 Codex session，切回来会接着之前的上下文。

@@ -60,30 +60,40 @@ const config = {
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
 const proxyAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
 
-const clientConfig = {
-  appId: config.appId,
-  appSecret: config.appSecret,
-  appType: Lark.AppType.SelfBuild,
-  domain: Lark.Domain.Feishu,
-  ...(proxyAgent ? { agent: proxyAgent } : {}),
-};
-
-const client = new Lark.Client(clientConfig);
-const wsClient = new Lark.WSClient({
-  ...clientConfig,
-  loggerLevel: Lark.LoggerLevel.info,
-  autoReconnect: true,
-  handshakeTimeoutMs: 30000,
-  source: 'feishu-codex-bridge',
-  onReady: () => log('feishu websocket connected'),
-  onReconnecting: () => log('feishu websocket reconnecting'),
-  onReconnected: () => log('feishu websocket reconnected'),
-  onError: (err) => log(`feishu websocket error: ${err.stack || err.message || err}`),
-});
+let client = createFeishuClient();
+let wsClient = createFeishuWsClient();
 
 const running = new Map();
 const handledReactionEvents = new Set();
 let taskSeq = 0;
+
+function feishuClientConfig() {
+  return {
+    appId: config.appId,
+    appSecret: config.appSecret,
+    appType: Lark.AppType.SelfBuild,
+    domain: Lark.Domain.Feishu,
+    ...(proxyAgent ? { agent: proxyAgent } : {}),
+  };
+}
+
+function createFeishuClient() {
+  return new Lark.Client(feishuClientConfig());
+}
+
+function createFeishuWsClient() {
+  return new Lark.WSClient({
+    ...feishuClientConfig(),
+    loggerLevel: Lark.LoggerLevel.info,
+    autoReconnect: true,
+    handshakeTimeoutMs: 30000,
+    source: 'feishu-codex-bridge',
+    onReady: () => log('feishu websocket connected'),
+    onReconnecting: () => log('feishu websocket reconnecting'),
+    onReconnected: () => log('feishu websocket reconnected'),
+    onError: (err) => log(`feishu websocket error: ${err.stack || err.message || err}`),
+  });
+}
 
 const dispatcher = new Lark.EventDispatcher({
   encryptKey: config.encryptKey,
@@ -144,7 +154,7 @@ async function handleIncomingMessage(data) {
 
   if (!chatId || !messageId || !senderId) return;
   if (!text && !attachments.length) return;
-  log(`message received chat=${chatId} context=${context.contextId} type=${chatType || 'unknown'} messageType=${messageType || 'unknown'} sender=${senderId} mentions=${mentions.length} attachments=${attachments.length} text=${singleLine(text).slice(0, 120)}`);
+  log(`message received chat=${chatId} context=${context.contextId} type=${chatType || 'unknown'} messageType=${messageType || 'unknown'} sender=${senderId} mentions=${mentions.length} attachments=${attachments.length} text=${redactSensitiveCommand(text)}`);
   if (config.allowedChatIds.length && !config.allowedChatIds.includes(chatId)) {
     log(`ignored message from unauthorized chat ${chatId}`);
     return;
@@ -484,6 +494,14 @@ async function runCommand(command, source) {
     await sendConfigForm(chatId, messageId, { isGroup: context && isGroupChat(context.chatType) });
     return;
   }
+  if (command.kind === 'timeout') {
+    await handleTimeoutCommand(command, { chatId, messageId, contextId });
+    return;
+  }
+  if (command.kind === 'account') {
+    await handleAccountCommand(command, { chatId, messageId });
+    return;
+  }
   if (command.kind === 'reset') {
     resetConversation(contextId);
     clearChatSession(contextId);
@@ -535,6 +553,8 @@ function parseCommand(rawText) {
   if (!body || (exactCommand && ['help', '帮助'].includes(commandLower))) return { kind: 'help' };
   if (exactCommand && ['status', '状态'].includes(commandLower)) return { kind: 'status' };
   if (exactCommand && ['config', 'settings', '设置', '偏好设置'].includes(commandLower)) return { kind: 'config' };
+  if (commandWithArgsAllowed && commandLower === 'timeout') return { kind: 'timeout', value: commandArgs.join(' ').trim() };
+  if (commandWithArgsAllowed && commandLower === 'account') return { kind: 'account', args: commandArgs };
   if (commandWithArgsAllowed && commandLower === 'new' && (commandArgs[0] || '').toLowerCase() === 'chat') {
     return { kind: 'newChat', topic: commandArgs.slice(1).join(' ').trim() };
   }
@@ -844,6 +864,7 @@ async function sendConfigForm(chatId, replyToMessageId, options = {}) {
     `**消息回复方式**：${prefs.replyMode === 'text' ? '纯文本' : '卡片'}`,
     `**工具调用显示**：${prefs.showToolCalls ? '显示' : '隐藏'}`,
     `**并发上限**：${maxConcurrentTasks}`,
+    `**全局 run 探活**：${timeoutStatusText({ mode: 'global', ms: effectiveGlobalRunTimeoutMs() })}`,
     `**群内 @ bot 才回复**：${requireMention ? '需要' : '不需要'}`,
   ].join('\n');
   const card = {
@@ -899,6 +920,108 @@ async function sendConfigForm(chatId, replyToMessageId, options = {}) {
     ]),
   };
   await sendCard(chatId, card, `偏好设置\n${summary}`, replyToMessageId, { forceCard: true });
+}
+
+async function handleTimeoutCommand(command, source) {
+  const workspace = workspaceForChat(projectChatId(source.contextId));
+  const raw = String(command.value || '').trim().toLowerCase();
+  if (!raw) {
+    const status = effectiveRunTimeout(source.contextId, workspace.name);
+    await sendUiMessage(source.chatId, {
+      kind: 'status',
+      title: '当前 session 探活',
+      template: 'blue',
+      summary: timeoutStatusText(status),
+      body: [
+        '`/timeout 15` 设置当前 session 15 分钟无响应自动 kill',
+        '`/timeout off` 当前 session 关闭探活',
+        '`/timeout default` 清掉当前 session 覆盖，跟随全局',
+      ].join('\n'),
+    }, source.messageId);
+    return;
+  }
+  if (raw === 'off') {
+    setSessionTimeoutOverride(source.contextId, workspace.name, 'off');
+  } else if (raw === 'default') {
+    clearSessionTimeoutOverride(source.contextId, workspace.name);
+  } else {
+    const minutes = Number.parseFloat(raw);
+    if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 24 * 60) {
+      await sendUiMessage(source.chatId, {
+        kind: 'warn',
+        title: '探活设置无效',
+        template: 'orange',
+        summary: '请输入 1 到 1440 之间的分钟数，或 off/default。',
+      }, source.messageId);
+      return;
+    }
+    setSessionTimeoutOverride(source.contextId, workspace.name, Math.round(minutes * 60 * 1000));
+  }
+  await sendUiMessage(source.chatId, {
+    kind: 'success',
+    title: '探活设置已更新',
+    template: 'green',
+    summary: timeoutStatusText(effectiveRunTimeout(source.contextId, workspace.name)),
+  }, source.messageId);
+}
+
+async function handleAccountCommand(command, source) {
+  const [action = '', appId = '', appSecret = ''] = command.args || [];
+  if (!action) {
+    await sendUiMessage(source.chatId, {
+      kind: 'status',
+      title: '当前 Feishu 应用',
+      template: 'blue',
+      summary: [
+        `**appId**：${maskSecret(config.appId, 8, 4)}`,
+        `**appSecret**：${maskSecret(config.appSecret, 4, 4)}`,
+        `**连接状态**：运行中`,
+      ].join('\n'),
+      body: '`/account change <appId> <appSecret>` 更新应用凭据并热重连。',
+    }, source.messageId);
+    return;
+  }
+  if (action.toLowerCase() !== 'change') {
+    await sendUiMessage(source.chatId, {
+      kind: 'warn',
+      title: '不支持的 account 命令',
+      template: 'orange',
+      summary: '`/account` 或 `/account change <appId> <appSecret>`',
+    }, source.messageId);
+    return;
+  }
+  if (!appId || !appSecret) {
+    await sendUiMessage(source.chatId, {
+      kind: 'warn',
+      title: '缺少应用凭据',
+      template: 'orange',
+      summary: '`/account change <appId> <appSecret>`',
+      body: '建议在私聊里执行，避免 secret 留在群消息里。',
+    }, source.messageId);
+    return;
+  }
+  try {
+    updateEnvFile({ FEISHU_APP_ID: appId, FEISHU_APP_SECRET: appSecret });
+    config.appId = appId;
+    config.appSecret = appSecret;
+    process.env.FEISHU_APP_ID = appId;
+    process.env.FEISHU_APP_SECRET = appSecret;
+    await reconnectFeishu();
+    await sendUiMessage(source.chatId, {
+      kind: 'success',
+      title: '应用已切换',
+      template: 'green',
+      summary: `appId：${maskSecret(config.appId, 8, 4)}\n已热重连 Feishu 长连接。`,
+    }, source.messageId);
+  } catch (err) {
+    await sendUiMessage(source.chatId, {
+      kind: 'error',
+      title: '应用切换失败',
+      template: 'red',
+      summary: formatApiError(err),
+    }, source.messageId);
+    log(`account change failed: ${err.stack || err.message || err}`);
+  }
 }
 
 function configButton(label, chatId, isGroup, key, value, selected) {
@@ -1179,6 +1302,7 @@ async function startCodexTask(prompt, source) {
   const outputFile = path.join(DATA_DIR, `${taskId}.last-message.txt`);
   const workspace = workspaceForChat(source.chatId);
   const contextId = source.contextId || source.chatId;
+  const runTimeout = effectiveRunTimeout(contextId, workspace.name);
   if (source.resetSession) clearChatSession(contextId, workspace.name);
   const existingSession = config.codexSessionsEnabled ? sessionForChat(contextId, workspace.name) : '';
   const shouldResume = Boolean(existingSession && !source.resetSession);
@@ -1207,6 +1331,7 @@ async function startCodexTask(prompt, source) {
     useMemory: source.useMemory,
     memoryReason: source.memoryReason,
     prompt,
+    runTimeout,
   }, source.messageId);
   log(`task ${taskId} start from=${source.senderId || 'unknown'} chat=${source.chatId} context=${contextId} workspace=${workspace.name} cwd=${cwd} session=${shouldResume ? existingSession : 'new'} memory=${source.useMemory ? source.memoryReason : 'new'} prompt=${singleLine(prompt).slice(0, 500)}`);
 
@@ -1237,22 +1362,20 @@ async function startCodexTask(prompt, source) {
     jsonOutput: true,
     jsonRemainder: '',
     timer: null,
+    timeoutTimer: null,
+    runTimeout,
+    lastActivityAt: Date.now(),
     killedByUser: false,
     showToolCalls: shouldShowToolCalls(source.chatId),
   };
   running.set(taskId, task);
 
-  const timeout = setTimeout(() => {
-    task.killedByUser = true;
-    child.kill('SIGTERM');
-    setTimeout(() => child.kill('SIGKILL'), 5000).unref();
-  }, config.codexTimeoutMs);
-  timeout.unref();
+  resetRunWatchdog(task);
 
   child.stdout.on('data', (chunk) => appendOutput(task, chunk.toString(), false));
   child.stderr.on('data', (chunk) => appendOutput(task, chunk.toString(), true));
   child.on('error', async (err) => {
-    clearTimeout(timeout);
+    clearRunWatchdog(task);
     running.delete(taskId);
     await flushTaskBuffer(task);
     await sendUiMessage(source.chatId, {
@@ -1265,7 +1388,7 @@ async function startCodexTask(prompt, source) {
     log(`task ${taskId} spawn error: ${err.stack || err.message}`);
   });
   child.on('close', async (code, signal) => {
-    clearTimeout(timeout);
+    clearRunWatchdog(task);
     running.delete(taskId);
     if (task.jsonOutput && task.jsonRemainder) appendCodexJsonOutput(task, '\n');
     await flushTaskBuffer(task);
@@ -1293,6 +1416,7 @@ async function startCodexTask(prompt, source) {
 }
 
 function appendOutput(task, text, isStderr) {
+  noteTaskActivity(task);
   if (!isStderr && task.jsonOutput) {
     appendCodexJsonOutput(task, text);
     return;
@@ -1345,6 +1469,7 @@ function appendCodexJsonOutput(task, text) {
 }
 
 function appendOutputText(task, text) {
+  noteTaskActivity(task);
   task.output += text;
   task.buffer += text;
   if (task.buffer.length > 3500) {
@@ -1357,6 +1482,35 @@ function appendOutputText(task, text) {
       void flushTaskBuffer(task);
     }, 5000);
     task.timer.unref();
+  }
+}
+
+function noteTaskActivity(task) {
+  task.lastActivityAt = Date.now();
+  resetRunWatchdog(task);
+}
+
+function resetRunWatchdog(task) {
+  clearRunWatchdog(task);
+  if (!task.runTimeout || task.runTimeout.mode === 'off' || !task.runTimeout.ms) return;
+  task.timeoutTimer = setTimeout(() => {
+    const idleFor = Date.now() - (task.lastActivityAt || task.startedAt || Date.now());
+    if (idleFor < task.runTimeout.ms) {
+      resetRunWatchdog(task);
+      return;
+    }
+    task.killedByUser = true;
+    task.output += `\nRun watchdog killed task after ${formatDuration(Math.round(idleFor / 1000))} without output.\n`;
+    task.child.kill('SIGTERM');
+    setTimeout(() => task.child.kill('SIGKILL'), 5000).unref();
+  }, task.runTimeout.ms);
+  task.timeoutTimer.unref();
+}
+
+function clearRunWatchdog(task) {
+  if (task.timeoutTimer) {
+    clearTimeout(task.timeoutTimer);
+    task.timeoutTimer = null;
   }
 }
 
@@ -1461,6 +1615,7 @@ async function sendTaskStarted(chatId, task, replyToMessageId) {
     `**工作目录**：${task.cwd}`,
     `**Codex session**：${task.isResume ? `继续 ${task.sessionId}` : '新建'}`,
     `**上下文**：${task.isResume ? '使用 Codex 原生会话' : (task.useMemory ? `继续模式（${task.memoryReason || 'explicit'}）` : '新任务隔离')}`,
+    `**Run 探活**：${timeoutStatusText(task.runTimeout)}`,
   ].filter(Boolean).join('\n');
   const promptArchive = config.archivePrompts ? archivePromptText(task.prompt) : '';
   await sendCard(chatId, {
@@ -1771,6 +1926,7 @@ async function sendStatus(chatId, replyToMessageId, contextId = chatId, contextL
   fields.push(`**默认工作目录**：${config.codexCwd}`);
   fields.push(`**上下文记忆**：${memoryStatusText()}`);
   fields.push(`**并发上限**：${effectiveMaxConcurrentTasks()}`);
+  fields.push(`**当前 session run 探活**：${timeoutStatusText(effectiveRunTimeout(contextId, workspace.name))}`);
   fields.push(`**回复方式**：${prefersPlainReplies(chatId) ? '纯文本' : '卡片'}`);
   fields.push(`**工具调用显示**：${shouldShowToolCalls(chatId) ? '显示' : '隐藏'}`);
   await sendCard(chatId, {
@@ -1787,6 +1943,8 @@ async function sendHelp(chatId, replyToMessageId) {
     '`/help` 查看帮助',
     '`/status` 查看状态',
     '`/config` 打开偏好设置',
+    '`/timeout [分钟|off|default]` 设置当前 session run 探活',
+    '`/account` 查看应用；`/account change <appId> <secret>` 热切换应用',
     '`/new` 开始新任务并清空当前会话上下文',
     '`/new chat <名字>` 自动创建一个新 project 群',
     '`/stop` 停止当前飞书会话的运行中任务',
@@ -2145,7 +2303,7 @@ function stripMention(text) {
 
 function statusText(chatId, contextId = chatId, contextLabel = '') {
   const workspace = workspaceForChat(chatId);
-  const preferences = `并发上限：${effectiveMaxConcurrentTasks()}\n回复方式：${prefersPlainReplies(chatId) ? '纯文本' : '卡片'}\n工具调用显示：${shouldShowToolCalls(chatId) ? '显示' : '隐藏'}`;
+  const preferences = `并发上限：${effectiveMaxConcurrentTasks()}\n当前 session run 探活：${timeoutStatusText(effectiveRunTimeout(contextId, workspace.name))}\n回复方式：${prefersPlainReplies(chatId) ? '纯文本' : '卡片'}\n工具调用显示：${shouldShowToolCalls(chatId) ? '显示' : '隐藏'}`;
   if (!running.size) return `当前没有运行中的 Codex 任务。桥接服务在线。\n${contextLabel ? `当前 session scope：${contextLabel}\n` : ''}当前 workspace：${workspace.name}\n当前会话工作目录：${workspace.cwd}\n当前 thread Codex session：${sessionForChat(contextId, workspace.name) || '未创建'}\n${conversationStatusText()}\n${preferences}`;
   const lines = ['运行中的任务：'];
   for (const task of running.values()) {
@@ -2182,6 +2340,8 @@ function helpText(chatId) {
     '执行任务：直接发送需求、图片或文件',
     '查看状态：/status',
     '偏好设置：/config',
+    '当前 session 探活：/timeout 15 / /timeout off / /timeout default',
+    '查看/切换飞书应用：/account',
     '新任务：/new',
     '新建 project 群：/new chat <名字>',
     '停止当前会话任务：/stop',
@@ -2685,7 +2845,9 @@ function setChatSession(chatId, sessionId, cwd, taskId, workspaceName = workspac
       updatedAt: existing.updatedAt,
     };
   }
+  const existingWorkspace = workspaces[normalized] && typeof workspaces[normalized] === 'object' ? workspaces[normalized] : {};
   workspaces[normalized] = {
+    ...existingWorkspace,
     sessionId,
     cwd,
     taskId,
@@ -2733,6 +2895,61 @@ function sessionEntryForWorkspace(chat, workspaceName) {
   if (chat.workspaces && typeof chat.workspaces === 'object') return chat.workspaces[normalized] || null;
   if (normalized === 'default' && chat.sessionId) return chat;
   return null;
+}
+
+function effectiveRunTimeout(chatId, workspaceName = workspaceForChat(projectChatId(chatId)).name) {
+  const sessions = loadSessions();
+  const entry = sessionEntryForWorkspace(sessions.chats && sessions.chats[chatId], workspaceName);
+  if (entry && entry.timeoutMsOverride === 'off') return { mode: 'off', ms: 0 };
+  if (entry && Number.isFinite(Number(entry.timeoutMsOverride))) {
+    return { mode: 'session', ms: Number(entry.timeoutMsOverride) };
+  }
+  const globalMs = effectiveGlobalRunTimeoutMs();
+  return globalMs > 0 ? { mode: 'global', ms: globalMs } : { mode: 'off', ms: 0 };
+}
+
+function effectiveGlobalRunTimeoutMs() {
+  const access = config.accessEnabled ? readAccessFile() : {};
+  const value = access.preferences && Number(access.preferences.runTimeoutMs);
+  if (Number.isFinite(value)) return Math.max(0, value);
+  return Math.max(0, Number(config.codexTimeoutMs || 0));
+}
+
+function setSessionTimeoutOverride(chatId, workspaceName, value) {
+  const sessions = loadSessions();
+  const normalized = normalizeWorkspaceName(workspaceName) || 'default';
+  sessions.chats = sessions.chats && typeof sessions.chats === 'object' ? sessions.chats : {};
+  const chat = sessions.chats[chatId] && typeof sessions.chats[chatId] === 'object' ? sessions.chats[chatId] : {};
+  const workspaces = chat.workspaces && typeof chat.workspaces === 'object' ? chat.workspaces : {};
+  const existing = workspaces[normalized] && typeof workspaces[normalized] === 'object' ? workspaces[normalized] : {};
+  workspaces[normalized] = {
+    ...existing,
+    timeoutMsOverride: value,
+    updatedAt: new Date().toISOString(),
+  };
+  sessions.chats[chatId] = {
+    ...chat,
+    workspaces,
+    updatedAt: new Date().toISOString(),
+  };
+  saveSessions(sessions);
+}
+
+function clearSessionTimeoutOverride(chatId, workspaceName) {
+  const sessions = loadSessions();
+  const normalized = normalizeWorkspaceName(workspaceName) || 'default';
+  const entry = sessions.chats && sessions.chats[chatId] && sessions.chats[chatId].workspaces && sessions.chats[chatId].workspaces[normalized];
+  if (!entry) return;
+  delete entry.timeoutMsOverride;
+  entry.updatedAt = new Date().toISOString();
+  sessions.chats[chatId].updatedAt = new Date().toISOString();
+  saveSessions(sessions);
+}
+
+function timeoutStatusText(timeout) {
+  if (!timeout || timeout.mode === 'off' || !timeout.ms) return '关闭';
+  const minutes = Math.round((timeout.ms / 60000) * 10) / 10;
+  return `${minutes} 分钟无响应自动 kill（${timeout.mode === 'session' ? '当前 session 覆盖' : '全局默认'}）`;
 }
 
 function loadSessions() {
@@ -2807,6 +3024,12 @@ function singleLine(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
+function redactSensitiveCommand(text) {
+  const value = singleLine(text);
+  if (/^\/?account\s+change\s+/i.test(value)) return value.replace(/^(.{0,80}?account\s+change\s+\S+)\s+.+$/i, '$1 ***');
+  return value.slice(0, 120);
+}
+
 function requireEnv(name) {
   const value = process.env[name];
   if (!value) {
@@ -2821,6 +3044,47 @@ function homeDir() {
 
 function maskUrl(url) {
   return url.replace(/\/\/([^:@]+):([^@]+)@/, '//***:***@');
+}
+
+function maskSecret(value, head = 6, tail = 4) {
+  const text = String(value || '');
+  if (!text) return '';
+  if (text.length <= head + tail) return `${text.slice(0, 2)}***`;
+  return `${text.slice(0, head)}...${text.slice(-tail)}`;
+}
+
+function updateEnvFile(values) {
+  const envPath = path.join(ROOT, '.env');
+  let text = '';
+  try {
+    text = fs.readFileSync(envPath, 'utf8');
+  } catch (err) {
+    if (!err || err.code !== 'ENOENT') throw err;
+  }
+  for (const [key, value] of Object.entries(values)) {
+    const line = `${key}=${shellEnvValue(value)}`;
+    const pattern = new RegExp(`^${key}=.*$`, 'm');
+    if (pattern.test(text)) text = text.replace(pattern, line);
+    else text = `${text.replace(/\s*$/, '')}\n${line}\n`;
+  }
+  fs.writeFileSync(envPath, text.endsWith('\n') ? text : `${text}\n`, { mode: 0o600 });
+}
+
+function shellEnvValue(value) {
+  const text = String(value || '');
+  if (/^[A-Za-z0-9_./:@-]+$/.test(text)) return text;
+  return JSON.stringify(text);
+}
+
+async function reconnectFeishu() {
+  const oldWsClient = wsClient;
+  client = createFeishuClient();
+  wsClient = createFeishuWsClient();
+  try {
+    oldWsClient.close({ force: true });
+  } catch {}
+  await wsClient.start({ eventDispatcher: dispatcher });
+  log(`feishu account reconnected app=${maskSecret(config.appId, 8, 4)}`);
 }
 
 function formatApiError(err) {
