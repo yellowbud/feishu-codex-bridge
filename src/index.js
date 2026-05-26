@@ -90,6 +90,13 @@ const dispatcher = new Lark.EventDispatcher({
       });
     });
   },
+  'card.action.trigger': (data) => {
+    setImmediate(() => {
+      handleCardAction(data).catch((err) => {
+        log(`card action handler error: ${err.stack || err.message || err}`);
+      });
+    });
+  },
 });
 
 main().catch((err) => {
@@ -191,6 +198,57 @@ async function handleIncomingMessage(data) {
     return;
   }
   await runCommand(command, { chatId, messageId, senderId, context });
+}
+
+async function handleCardAction(data) {
+  const evt = typeof Lark.normalizeCardAction === 'function'
+    ? Lark.normalizeCardAction(data)
+    : normalizeRawCardAction(data);
+  if (!evt) return;
+  const value = evt.action && evt.action.value && typeof evt.action.value === 'object' ? evt.action.value : {};
+  if (value.kind !== 'codex_prompt' || !value.prompt) {
+    log(`ignored card action message=${evt.messageId || 'unknown'} action=${JSON.stringify(value).slice(0, 500)}`);
+    return;
+  }
+  const chatId = value.chatId || evt.chatId;
+  const contextId = value.contextId || chatId;
+  if (!chatId) return;
+  await sendUiMessage(chatId, {
+    kind: 'status',
+    title: '已选择',
+    template: 'blue',
+    summary: String(value.label || value.prompt).slice(0, 300),
+  }, evt.messageId);
+  await startCodexTask(String(value.prompt), {
+    chatId,
+    messageId: evt.messageId,
+    senderId: evt.operator && (evt.operator.openId || evt.operator.userId) || 'card-action',
+    contextId,
+    contextLabel: value.contextLabel || 'card action',
+    useMemory: true,
+    memoryReason: 'card-action',
+    resetSession: false,
+  });
+}
+
+function normalizeRawCardAction(data) {
+  const action = data && data.action || {};
+  const context = data && data.context || {};
+  const operator = data && data.operator || {};
+  return {
+    messageId: context.open_message_id || data.open_message_id,
+    chatId: context.open_chat_id || data.open_chat_id,
+    operator: {
+      openId: operator.open_id || data.open_id,
+      userId: operator.user_id || data.user_id,
+      name: operator.name,
+    },
+    action: {
+      value: action.value || {},
+      tag: action.tag,
+      option: action.option,
+    },
+  };
 }
 
 async function handleAttachmentMessage(input) {
@@ -1090,6 +1148,8 @@ async function sendTaskFinished(chatId, task, replyToMessageId) {
   const template = success ? 'green' : (cancelled ? 'orange' : 'red');
   const resultText = task.finalMessage || task.tail || '无输出。';
   const media = success ? collectOutboundMedia(resultText, task.cwd) : [];
+  const rich = success ? extractRichOutputs(resultText) : { text: resultText, tables: [], cards: [], actions: [] };
+  const displayText = rich.text || (rich.tables.length || rich.cards.length || rich.actions.length || media.length ? '已生成富文本/多媒体内容。' : resultText);
   const title = `Codex 任务${task.verdict}`;
   const meta = [
     `**任务 ID**：${task.taskId}`,
@@ -1099,7 +1159,7 @@ async function sendTaskFinished(chatId, task, replyToMessageId) {
     success || !task.signal ? null : `**信号**：${task.signal}`,
   ].filter(Boolean).join('\n');
 
-  for (const [index, chunk] of chunkText(resultText, 2800, 'newline').entries()) {
+  for (const [index, chunk] of chunkText(displayText, 2800, 'newline').entries()) {
     await sendCard(chatId, {
       header: {
         template,
@@ -1110,7 +1170,20 @@ async function sendTaskFinished(chatId, task, replyToMessageId) {
         { tag: 'markdown', content: chunk },
         !task.finalMessage && task.tail ? { tag: 'markdown', content: '_未读取到最终回复文件，展示 CLI 尾部输出。_' } : null,
       ]),
-    }, `${title}\n${meta}\n\n${resultText}`, replyToMessageId);
+    }, `${title}\n${meta}\n\n${displayText}`, replyToMessageId);
+  }
+  for (const table of rich.tables) {
+    await sendTableCard(chatId, table, replyToMessageId);
+  }
+  for (const card of rich.cards) {
+    await sendCustomCard(chatId, card, replyToMessageId);
+  }
+  for (const actionCard of rich.actions) {
+    await sendActionCard(chatId, actionCard, {
+      replyToMessageId,
+      contextId: task.contextId,
+      contextLabel: task.workspaceName || 'current',
+    });
   }
   if (media.length) {
     await sendOutboundMedia(chatId, media, replyToMessageId);
@@ -1128,6 +1201,64 @@ async function sendLogChunk(chatId, taskId, chunk, replyToMessageId) {
       { tag: 'markdown', content: codeBlock(compactMiddle(chunk, 2600)) },
     ]),
   }, `任务 ${taskId} 实时输出：\n${chunk}`, replyToMessageId);
+}
+
+async function sendTableCard(chatId, table, replyToMessageId) {
+  const rows = parseTableRows(table.content);
+  const elements = [];
+  if (table.title) {
+    elements.push({ tag: 'markdown', content: `**${escapeMarkdownLine(table.title)}**` });
+  }
+  if (rows.length) {
+    elements.push(...tableElements(rows));
+  } else {
+    elements.push({ tag: 'markdown', content: compactMiddle(table.content, 3000) });
+  }
+  await sendCard(chatId, {
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'turquoise',
+      title: { tag: 'plain_text', content: table.title || '表格' },
+    },
+    elements: cardElements(elements),
+  }, `${table.title || '表格'}\n${table.content}`, replyToMessageId);
+}
+
+async function sendCustomCard(chatId, card, replyToMessageId) {
+  await sendCard(chatId, card, JSON.stringify(card).slice(0, 3000), replyToMessageId);
+}
+
+async function sendActionCard(chatId, actionCard, options) {
+  const actions = Array.isArray(actionCard.actions) ? actionCard.actions.slice(0, 6) : [];
+  if (!actions.length) return;
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      template: actionCard.template || 'blue',
+      title: { tag: 'plain_text', content: actionCard.title || '选择下一步' },
+    },
+    elements: cardElements([
+      actionCard.body ? { tag: 'markdown', content: String(actionCard.body).slice(0, 2500) } : null,
+      {
+        tag: 'action',
+        layout: actions.length >= 3 ? 'flow' : 'bisected',
+        actions: actions.map((action, index) => ({
+          tag: 'button',
+          text: { tag: 'plain_text', content: String(action.label || `选项 ${index + 1}`).slice(0, 40) },
+          type: ['primary', 'danger', 'default'].includes(action.type) ? action.type : (index === 0 ? 'primary' : 'default'),
+          value: {
+            kind: 'codex_prompt',
+            label: String(action.label || `选项 ${index + 1}`),
+            prompt: String(action.prompt || action.value || action.label || ''),
+            chatId,
+            contextId: options.contextId,
+            contextLabel: options.contextLabel,
+          },
+        })),
+      },
+    ]),
+  };
+  await sendCard(chatId, card, `${actionCard.title || '选择下一步'}\n${actions.map((action) => `- ${action.label}: ${action.prompt || action.value || ''}`).join('\n')}`, options.replyToMessageId);
 }
 
 async function sendStatus(chatId, replyToMessageId, contextId = chatId, contextLabel = '') {
@@ -1636,7 +1767,11 @@ function compactTail(text, max) {
 function buildOutboundMediaPrompt(prompt, cwd) {
   if (!config.outboundMediaEnabled) return prompt;
   return [
-    '你可以突破纯文字限制和飞书用户沟通：如果需要发送图片、截图、PDF、表格、压缩包或其他文件，请先把文件保存到本机当前工作目录或 data/ /private/tmp 下，然后在最终回复里写出绝对路径，或用 Markdown 链接引用，例如 `![图](/path/to/image.png)`、`[报告](/path/to/report.pdf)`。桥接服务会自动上传这些本机路径到飞书；不要只描述“已生成”，要给出路径。',
+    '你可以突破纯文字限制和飞书用户沟通：',
+    '- 发送图片、长图、截图、PDF、表格、压缩包或其他文件：先保存到本机当前工作目录或 data/ /private/tmp 下，然后在最终回复里写出绝对路径，或用 Markdown 链接引用，例如 `![长图](/path/to/long.png)`、`[报告](/path/to/report.pdf)`。桥接服务会自动上传这些本机路径到飞书；不要只描述“已生成”，要给出路径。',
+    '- 渲染表格：在最终回复加入 fenced block：```feishu-table title="标题"\\n| 列1 | 列2 |\\n| --- | --- |\\n| ... | ... |\\n```。桥接会渲染成飞书表格卡片。',
+    '- 发送交互卡片：在最终回复加入 fenced block：```feishu-actions\\n{"title":"选择下一步","body":"请选择","actions":[{"label":"方案A","prompt":"按方案A继续","type":"primary"},{"label":"方案B","prompt":"按方案B继续"}]}\\n```。用户点按钮后，桥接会把对应 prompt 作为同一 session 的新任务执行。',
+    '- 高级卡片：如果需要完整自定义飞书卡片，可输出 ```feishu-card\\n{...完整 interactive card JSON...}\\n```。',
     `当前工作目录：${cwd}`,
     '',
     '用户请求：',
@@ -1665,6 +1800,83 @@ function collectOutboundMedia(text, cwd) {
     }
   }
   return found;
+}
+
+function extractRichOutputs(text) {
+  const rich = { text: String(text || ''), tables: [], cards: [], actions: [] };
+  rich.text = rich.text.replace(/```(feishu-table|feishu-card|feishu-actions)([^\n`]*)\n([\s\S]*?)```/g, (_full, kind, attrs, body) => {
+    const content = String(body || '').trim();
+    if (kind === 'feishu-table') {
+      rich.tables.push({ title: attrValue(attrs, 'title') || '表格', content });
+    } else if (kind === 'feishu-card') {
+      const card = parseJsonBlock(content);
+      if (card) rich.cards.push(card);
+    } else if (kind === 'feishu-actions') {
+      const card = parseJsonBlock(content);
+      if (card) rich.actions.push(card);
+    }
+    return '';
+  }).replace(/\n{3,}/g, '\n\n').trim();
+  return rich;
+}
+
+function attrValue(attrs, key) {
+  const pattern = new RegExp(`${key}=("[^"]*"|'[^']*'|\\S+)`);
+  const match = String(attrs || '').match(pattern);
+  if (!match) return '';
+  return match[1].replace(/^['"]|['"]$/g, '');
+}
+
+function parseJsonBlock(content) {
+  try {
+    const parsed = JSON.parse(content);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseTableRows(content) {
+  const lines = String(content || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) return [];
+  if (lines[0].includes('|')) return parseMarkdownTable(lines);
+  if (lines[0].includes(',')) return parseCsvTable(lines);
+  return [];
+}
+
+function parseMarkdownTable(lines) {
+  const rows = lines
+    .filter((line) => line.includes('|'))
+    .map((line) => line.replace(/^\||\|$/g, '').split('|').map((cell) => cell.trim()));
+  if (rows.length < 2) return rows;
+  const separator = rows[1].every((cell) => /^:?-{3,}:?$/.test(cell));
+  return separator ? [rows[0], ...rows.slice(2)] : rows;
+}
+
+function parseCsvTable(lines) {
+  return lines.map((line) => line.split(',').map((cell) => cell.trim()));
+}
+
+function tableElements(rows) {
+  const [header = [], ...body] = rows;
+  if (!header.length) return [];
+  const widths = header.map((_, index) => Math.max(...rows.map((row) => String(row[index] || '').length), 3));
+  const normalized = [header, ...body.slice(0, 30)];
+  const markdown = normalized.map((row, rowIndex) => {
+    const cells = header.map((_, index) => String(row[index] || '').padEnd(Math.min(widths[index], 24), ' '));
+    const line = `| ${cells.join(' | ')} |`;
+    if (rowIndex !== 0) return line;
+    return `${line}\n| ${header.map((_, index) => '-'.repeat(Math.min(widths[index], 24))).join(' | ')} |`;
+  }).join('\n');
+  const elements = [{ tag: 'markdown', content: markdown }];
+  if (body.length > 30) {
+    elements.push({ tag: 'markdown', content: `_仅展示前 30 行，共 ${body.length} 行数据。_` });
+  }
+  return elements;
+}
+
+function escapeMarkdownLine(text) {
+  return String(text || '').replace(/\n/g, ' ').trim();
 }
 
 function outboundMediaItem(rawPath, cwd) {
