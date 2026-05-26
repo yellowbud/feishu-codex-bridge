@@ -1,0 +1,25 @@
+{
+  "name": "feishu-codex-bridge",
+  "version": "1.0.0",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js",
+    "access": "node scripts/access.js",
+    "install-service": "bash scripts/install-launchd.sh",
+    "uninstall-service": "bash scripts/uninstall-launchd.sh",
+    "service-status": "launchctl print gui/$(id -u)/com.local.feishu-codex-bridge | grep -E 'state =|pid =' || true"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "Local Feishu long-connection bridge for controlling Codex CLI",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.65.0",
+    "dotenv": "^17.4.2",
+    "https-proxy-agent": "^7.0.6"
+  },
+  "overrides": {
+    "axios": "1.16.1"
+  }
+}
