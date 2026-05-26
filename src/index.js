@@ -233,6 +233,10 @@ async function handleCardAction(data) {
     await handleConfigAction(evt, value);
     return;
   }
+  if (value.kind === 'bridge_resume') {
+    await handleResumeAction(evt, value);
+    return;
+  }
   if (value.kind !== 'codex_prompt' || !value.prompt) {
     log(`ignored card action message=${evt.messageId || 'unknown'} action=${JSON.stringify(value).slice(0, 500)}`);
     return;
@@ -277,6 +281,33 @@ async function handleConfigAction(evt, value) {
     title: '偏好设置已更新',
     template: 'green',
   });
+}
+
+async function handleResumeAction(evt, value) {
+  const chatId = value.chatId || evt.chatId;
+  if (!chatId || !value.sessionId) return;
+  const operatorId = evt.operator && (evt.operator.openId || evt.operator.userId) || 'card-action';
+  const gateResult = gateAction({ chatId, senderId: operatorId, chatType: value.chatType || 'group' });
+  if (gateResult.action !== 'deliver') {
+    log(`resume access drop chat=${chatId} sender=${operatorId}`);
+    return;
+  }
+  const contextId = value.contextId || chatId;
+  const workspaceName = normalizeWorkspaceName(value.workspaceName) || workspaceForChat(projectChatId(contextId)).name;
+  const cwd = value.cwd || workspaceForChat(projectChatId(contextId)).cwd;
+  setNamedWorkspace(projectChatId(contextId), workspaceName, cwd, true);
+  setChatSession(contextId, String(value.sessionId), cwd, value.taskId || 'manual-resume', workspaceName);
+  await sendUiMessage(chatId, {
+    kind: 'success',
+    title: '会话已恢复',
+    template: 'green',
+    summary: [
+      `**Workspace**：${workspaceName}`,
+      `**工作目录**：${cwd}`,
+      `**Codex session**：${value.sessionId}`,
+    ].join('\n'),
+    body: '下一条消息会接着这个 Codex session 运行。',
+  }, evt.messageId);
 }
 
 async function handleReactionCreated(data) {
@@ -502,6 +533,10 @@ async function runCommand(command, source) {
     await handleAccountCommand(command, { chatId, messageId });
     return;
   }
+  if (command.kind === 'resume') {
+    await sendResumePicker(chatId, messageId, contextId, command.limit);
+    return;
+  }
   if (command.kind === 'reset') {
     resetConversation(contextId);
     clearChatSession(contextId);
@@ -555,6 +590,7 @@ function parseCommand(rawText) {
   if (exactCommand && ['config', 'settings', '设置', '偏好设置'].includes(commandLower)) return { kind: 'config' };
   if (commandWithArgsAllowed && commandLower === 'timeout') return { kind: 'timeout', value: commandArgs.join(' ').trim() };
   if (commandWithArgsAllowed && commandLower === 'account') return { kind: 'account', args: commandArgs };
+  if (commandWithArgsAllowed && ['resume', '恢复'].includes(commandLower)) return { kind: 'resume', limit: clampInt(commandArgs[0] || 5, 1, 10) };
   if (commandWithArgsAllowed && commandLower === 'new' && (commandArgs[0] || '').toLowerCase() === 'chat') {
     return { kind: 'newChat', topic: commandArgs.slice(1).join(' ').trim() };
   }
@@ -659,12 +695,14 @@ async function createManagedChat(topic, source) {
     if (!newChatId) throw new Error(`create chat returned no chat_id: ${JSON.stringify(response).slice(0, 1000)}`);
 
     allowManagedGroup(newChatId, source.senderId);
+    const inheritedWorkspace = workspaceForChat(source.chatId);
+    setNamedWorkspace(newChatId, inheritedWorkspace.name, inheritedWorkspace.cwd, true);
     await sendUiMessage(source.chatId, {
       kind: 'success',
       title: '新群聊已创建',
       template: 'green',
       summary: `**${title}**\nchat_id: ${newChatId}`,
-      body: '机器人已把你拉入新群。后续在新群里直接发消息即可；每个话题/thread 会保留自己的 Codex session。',
+      body: `机器人已把你拉入新群，并继承当前工作目录：\`${inheritedWorkspace.cwd}\`。后续在新群里直接发消息即可；每个话题/thread 会保留自己的 Codex session。`,
     }, source.messageId);
     await sendUiMessage(newChatId, {
       kind: 'success',
@@ -672,7 +710,7 @@ async function createManagedChat(topic, source) {
       template: 'blue',
       summary: '这个群就是一个 project。',
       body: [
-        '直接在群里发需求即可开始任务。',
+        `已继承工作目录：\`${inheritedWorkspace.cwd}\`。直接在群里发需求即可开始任务。`,
         '在话题群里每个话题是独立 session；普通群里每个消息 thread 是独立 session。',
         '可用 `/cd <目录>` 绑定项目目录，或 `/ws add <name> <目录>` 管理多个 workspace。',
       ].join('\n'),
@@ -1022,6 +1060,52 @@ async function handleAccountCommand(command, source) {
     }, source.messageId);
     log(`account change failed: ${err.stack || err.message || err}`);
   }
+}
+
+async function sendResumePicker(chatId, replyToMessageId, contextId, limit = 5) {
+  const sessions = recentSessionsForProject(chatId, limit);
+  const isGroup = Boolean(readAccessFile().groups[chatId]);
+  if (!sessions.length) {
+    await sendUiMessage(chatId, {
+      kind: 'warn',
+      title: '没有可恢复的历史会话',
+      template: 'orange',
+      summary: '当前 project 还没有记录到 Codex session。',
+    }, replyToMessageId);
+    return;
+  }
+  const rows = sessions.map((session, index) => {
+    const when = session.updatedAt ? new Date(session.updatedAt).toLocaleString('zh-CN', { hour12: false }) : '未知时间';
+    return `${index + 1}. **${escapeMarkdownLine(session.workspaceName)}** · ${escapeMarkdownLine(session.label)}\n${when}\n${session.cwd}`;
+  });
+  await sendCard(chatId, {
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: '恢复历史会话' },
+    },
+    elements: cardElements([
+      { tag: 'markdown', content: rows.join('\n\n') },
+      ...sessions.map((session, index) => ({
+        tag: 'action',
+        actions: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: `恢复 ${index + 1}` },
+          type: index === 0 ? 'primary' : 'default',
+          value: {
+            kind: 'bridge_resume',
+            chatId,
+            chatType: isGroup ? 'group' : 'p2p',
+            contextId,
+            sessionId: session.sessionId,
+            workspaceName: session.workspaceName,
+            cwd: session.cwd,
+            taskId: session.taskId,
+          },
+        }],
+      })),
+    ]),
+  }, `恢复历史会话\n${rows.join('\n\n')}`, replyToMessageId, { forceCard: true });
 }
 
 function configButton(label, chatId, isGroup, key, value, selected) {
@@ -1947,6 +2031,7 @@ async function sendHelp(chatId, replyToMessageId) {
     '`/account` 查看应用；`/account change <appId> <secret>` 热切换应用',
     '`/new` 开始新任务并清空当前会话上下文',
     '`/new chat <名字>` 自动创建一个新 project 群',
+    '`/resume [N]` 列出最近 N 个历史会话并一键恢复',
     '`/stop` 停止当前飞书会话的运行中任务',
     '`/cancel <taskId>` 按任务 ID 取消',
     '`/cd <目录>` 切换当前飞书会话的工作目录',
@@ -2344,6 +2429,7 @@ function helpText(chatId) {
     '查看/切换飞书应用：/account',
     '新任务：/new',
     '新建 project 群：/new chat <名字>',
+    '恢复历史会话：/resume 5',
     '停止当前会话任务：/stop',
     '取消指定任务：/cancel <taskId>',
     '切换目录：/cd <目录>',
@@ -2887,6 +2973,34 @@ function clearProjectSessions(chatId) {
     }
   }
   if (changed) saveSessions(sessions);
+}
+
+function recentSessionsForProject(chatId, limit = 5) {
+  const sessions = loadSessions();
+  const projectId = projectChatId(chatId);
+  const prefix = `${projectId}::thread:`;
+  const rows = [];
+  for (const [contextId, chat] of Object.entries(sessions.chats || {})) {
+    if (contextId !== projectId && !contextId.startsWith(prefix)) continue;
+    const workspaces = chat && chat.workspaces && typeof chat.workspaces === 'object'
+      ? chat.workspaces
+      : (chat && chat.sessionId ? { default: chat } : {});
+    for (const [workspaceName, entry] of Object.entries(workspaces)) {
+      if (!entry || !entry.sessionId) continue;
+      rows.push({
+        contextId,
+        label: contextId === projectId ? '主会话' : contextId.slice(prefix.length) || contextId,
+        workspaceName: normalizeWorkspaceName(workspaceName) || 'default',
+        sessionId: entry.sessionId,
+        cwd: entry.cwd || workspaceForChat(projectId).cwd,
+        taskId: entry.taskId || '',
+        updatedAt: entry.updatedAt || chat.updatedAt || '',
+      });
+    }
+  }
+  return rows
+    .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime())
+    .slice(0, clampInt(limit, 1, 10));
 }
 
 function sessionEntryForWorkspace(chat, workspaceName) {
