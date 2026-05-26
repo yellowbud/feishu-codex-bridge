@@ -88,6 +88,7 @@ Codex 也可以发回多媒体：如果最终回复里出现本机图片或文�
 /timeout 15
 /timeout off
 /timeout default
+/reconnect
 /account
 /account change <appId> <appSecret>
 /new
@@ -112,6 +113,8 @@ Codex 也可以发回多媒体：如果最终回复里出现本机图片或文�
 - `/resume [N]` 列出最近 N 个历史 Codex session，点按钮恢复到当前 thread。
 - `/config` 打开偏好设置卡片，可调整消息回复方式、工具调用显示、并发上限、群内是否需要 @ bot。
 - `/timeout` 查看当前 session 的 run 探活设置；`/timeout 15` 表示 15 分钟无输出自动 kill；`/timeout off` 关闭；`/timeout default` 跟随全局默认。
+- `/stop` 终止当前 thread 正在跑的任务；任务开始卡片底部的 `⏹ 终止` 按钮等同于 `/stop`。
+- `/reconnect` 强制重连 Feishu WebSocket，适合网络抖动后 bot 没反应时使用。
 - `/account` 查看或切换当前绑定的 bot；`/account change <appId> <appSecret>` 更新 `.env` 并热重连。建议在私聊里执行，避免 secret 留在群记录里。
 - `/cd <路径>` 切换当前 cwd，并重置当前 project/session。
 - `/ws list` 列出所有命名 workspace，并显示按钮一键切换。

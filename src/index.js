@@ -214,6 +214,7 @@ async function handleIncomingMessage(data) {
       senderId,
       contextId: context.contextId,
       contextLabel: context.label,
+      chatType,
       useMemory: command.useMemory,
       memoryReason: command.memoryReason,
       resetSession: command.resetSession,
@@ -241,6 +242,10 @@ async function handleCardAction(data) {
     await handleWorkspaceAction(evt, value);
     return;
   }
+  if (value.kind === 'bridge_stop') {
+    await handleStopAction(evt, value);
+    return;
+  }
   if (value.kind !== 'codex_prompt' || !value.prompt) {
     log(`ignored card action message=${evt.messageId || 'unknown'} action=${JSON.stringify(value).slice(0, 500)}`);
     return;
@@ -260,6 +265,7 @@ async function handleCardAction(data) {
     senderId: evt.operator && (evt.operator.openId || evt.operator.userId) || 'card-action',
     contextId,
     contextLabel: value.contextLabel || 'card action',
+    chatType: value.chatType,
     useMemory: true,
     memoryReason: 'card-action',
     resetSession: false,
@@ -324,6 +330,18 @@ async function handleWorkspaceAction(evt, value) {
     return;
   }
   await switchWorkspace(chatId, value.name, evt.messageId);
+}
+
+async function handleStopAction(evt, value) {
+  const chatId = value.chatId || evt.chatId;
+  if (!chatId) return;
+  const operatorId = evt.operator && (evt.operator.openId || evt.operator.userId) || 'card-action';
+  const gateResult = gateAction({ chatId, senderId: operatorId, chatType: value.chatType || 'group' });
+  if (gateResult.action !== 'deliver') {
+    log(`stop action access drop chat=${chatId} sender=${operatorId}`);
+    return;
+  }
+  await cancelChatTasks(chatId, evt.messageId, { contextId: value.contextId });
 }
 
 async function handleReactionCreated(data) {
@@ -392,6 +410,7 @@ async function handleReactionCreated(data) {
     senderId: operatorId,
     contextId: context.contextId,
     contextLabel: context.label,
+    chatType: message.chat_type,
     useMemory: true,
     memoryReason: 'reaction-forward',
     resetSession: false,
@@ -519,6 +538,7 @@ async function handleAttachmentMessage(input) {
     senderId: input.senderId,
     contextId: input.context && input.context.contextId,
     contextLabel: input.context && input.context.label,
+    chatType: input.context && input.context.chatType,
     useMemory: parsed && parsed.kind === 'run' ? parsed.useMemory : memoryHint.useMemory,
     memoryReason: parsed && parsed.kind === 'run' ? parsed.memoryReason : memoryHint.reason,
     resetSession: parsed && parsed.kind === 'run' ? parsed.resetSession : memoryHint.resetSession,
@@ -551,6 +571,10 @@ async function runCommand(command, source) {
   }
   if (command.kind === 'resume') {
     await sendResumePicker(chatId, messageId, contextId, command.limit);
+    return;
+  }
+  if (command.kind === 'reconnect') {
+    await handleReconnectCommand(chatId, messageId);
     return;
   }
   if (command.kind === 'reset') {
@@ -607,6 +631,7 @@ function parseCommand(rawText) {
   if (commandWithArgsAllowed && commandLower === 'timeout') return { kind: 'timeout', value: commandArgs.join(' ').trim() };
   if (commandWithArgsAllowed && commandLower === 'account') return { kind: 'account', args: commandArgs };
   if (commandWithArgsAllowed && ['resume', '恢复'].includes(commandLower)) return { kind: 'resume', limit: clampInt(commandArgs[0] || 5, 1, 10) };
+  if (exactCommand && ['reconnect', '重连'].includes(commandLower)) return { kind: 'reconnect' };
   if (commandWithArgsAllowed && commandLower === 'new' && (commandArgs[0] || '').toLowerCase() === 'chat') {
     return { kind: 'newChat', topic: commandArgs.slice(1).join(' ').trim() };
   }
@@ -1171,6 +1196,26 @@ async function sendResumePicker(chatId, replyToMessageId, contextId, limit = 5) 
   }, `恢复历史会话\n${rows.join('\n\n')}`, replyToMessageId, { forceCard: true });
 }
 
+async function handleReconnectCommand(chatId, replyToMessageId) {
+  try {
+    await reconnectFeishu('manual');
+    await sendUiMessage(chatId, {
+      kind: 'success',
+      title: 'WebSocket 已重连',
+      template: 'green',
+      summary: `当前应用：${maskSecret(config.appId, 8, 4)}`,
+    }, replyToMessageId);
+  } catch (err) {
+    await sendUiMessage(chatId, {
+      kind: 'error',
+      title: 'WebSocket 重连失败',
+      template: 'red',
+      summary: formatApiError(err),
+    }, replyToMessageId);
+    log(`manual reconnect failed: ${err.stack || err.message || err}`);
+  }
+}
+
 function configButton(label, chatId, isGroup, key, value, selected) {
   return {
     tag: 'button',
@@ -1475,6 +1520,8 @@ async function startCodexTask(prompt, source) {
     sessionId: shouldResume ? existingSession : '',
     isResume: shouldResume,
     contextLabel: source.contextLabel,
+    contextId,
+    isGroup: isGroupChat(source.chatType),
     useMemory: source.useMemory,
     memoryReason: source.memoryReason,
     prompt,
@@ -1765,6 +1812,20 @@ async function sendTaskStarted(chatId, task, replyToMessageId) {
     `**Run 探活**：${timeoutStatusText(task.runTimeout)}`,
   ].filter(Boolean).join('\n');
   const promptArchive = config.archivePrompts ? archivePromptText(task.prompt) : '';
+  const stopButton = {
+    tag: 'action',
+    actions: [{
+      tag: 'button',
+      text: { tag: 'plain_text', content: '⏹ 终止' },
+      type: 'danger',
+      value: {
+        kind: 'bridge_stop',
+        chatId,
+        chatType: task.isGroup ? 'group' : 'p2p',
+        contextId: task.contextId,
+      },
+    }],
+  };
   await sendCard(chatId, {
     header: {
       template: 'blue',
@@ -1773,6 +1834,7 @@ async function sendTaskStarted(chatId, task, replyToMessageId) {
     elements: cardElements([
       { tag: 'markdown', content: `任务已开始，完成后会直接返回结果。\n\n${details}` },
       promptArchive ? { tag: 'markdown', content: `**输入归档**\n${promptArchive}` } : null,
+      stopButton,
     ]),
   }, `Codex 已接收\n${details}`, replyToMessageId);
 }
@@ -2091,6 +2153,7 @@ async function sendHelp(chatId, replyToMessageId) {
     '`/status` 查看状态',
     '`/config` 打开偏好设置',
     '`/timeout [分钟|off|default]` 设置当前 session run 探活',
+    '`/reconnect` 强制重连 Feishu WebSocket',
     '`/account` 查看应用；`/account change <appId> <secret>` 热切换应用',
     '`/new` 开始新任务并清空当前会话上下文',
     '`/new chat <名字>` 自动创建一个新 project 群',
@@ -2489,6 +2552,7 @@ function helpText(chatId) {
     '查看状态：/status',
     '偏好设置：/config',
     '当前 session 探活：/timeout 15 / /timeout off / /timeout default',
+    '强制重连：/reconnect',
     '查看/切换飞书应用：/account',
     '新任务：/new',
     '新建 project 群：/new chat <名字>',
@@ -3253,7 +3317,7 @@ function shellEnvValue(value) {
   return JSON.stringify(text);
 }
 
-async function reconnectFeishu() {
+async function reconnectFeishu(reason = 'account-change') {
   const oldWsClient = wsClient;
   client = createFeishuClient();
   wsClient = createFeishuWsClient();
@@ -3261,7 +3325,7 @@ async function reconnectFeishu() {
     oldWsClient.close({ force: true });
   } catch {}
   await wsClient.start({ eventDispatcher: dispatcher });
-  log(`feishu account reconnected app=${maskSecret(config.appId, 8, 4)}`);
+  log(`feishu websocket reconnected reason=${reason} app=${maskSecret(config.appId, 8, 4)}`);
 }
 
 function formatApiError(err) {
