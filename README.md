@@ -117,7 +117,7 @@ Codex 的回复也不只限于纯文字。它可以把本机生成的图片、PD
 | `/exit #1` 或 `/exit <pid>` | 终止指定 bridge 进程 |
 | `/doctor [描述]` | 用最近日志生成故障诊断 |
 
-`/config` 可调整回复方式、工具调用显示、并发上限、群里是否必须 @ bot。`/account change` 建议在私聊里执行，避免 secret 留在群记录里。`/exit` 只会终止 `/ps` 识别出的 bridge 进程；关当前进程会 graceful 退出，关其他 bridge 进程会发 SIGTERM。
+`/config` 用来调整日常使用偏好，比如回复用卡片还是纯文本、是否展示工具调用、并发上限，以及群里是否必须 @ bot 才响应。切换应用凭据时建议在私聊里用 `/account change`，避免 secret 留在群记录里。`/exit` 只会关闭 `/ps` 列出的 bridge 进程：关闭当前进程会先 graceful 退出，关闭其他进程会发送 SIGTERM。
 
 ### 飞书原生输出
 
