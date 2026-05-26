@@ -41,7 +41,8 @@ tail -f logs/bridge.log
 3. 订阅事件：`im.message.receive_v1`。
 4. 私聊消息需要机器人消息权限。
 5. 群里不 `@机器人` 也要收到消息时，开启权限：`获取群组中所有消息` / `im:message.group_msg`。
-6. 改权限后重新发布应用版本，并把机器人加入目标群。
+6. 需要直接发送图片/文件时，开启权限：`获取消息中的资源文件`。
+7. 改权限后重新发布应用版本，并把机器人加入目标群。
 
 如果没有 `im:message.group_msg`，飞书通常只会把 `@机器人` 的群消息投递给应用。
 
@@ -52,6 +53,8 @@ tail -f logs/bridge.log
 ```text
 帮我检查这个项目
 ```
+
+也可以直接发送图片或文件。机器人会先下载到本机 `data/attachments/`，再把本机路径交给 Codex 读取。
 
 常用命令：
 
@@ -74,6 +77,7 @@ tail -f logs/bridge.log
 - `/ws add <name> <目录>` 添加命名 workspace。
 - `/ws <name>` 在同一个飞书会话里切换 workspace。
 - 每个 workspace 都有自己的 Codex session，切回来会接着之前的上下文。
+- 图片和文件消息也会使用当前 workspace 与当前 Codex session。
 - `/new` 清空当前飞书会话的 Codex session，开启全新任务。
 - `/new <任务>` 开新 session 并立刻执行这个任务。
 - `/cd` 会更新当前 workspace 的目录，并同时开启新 session。

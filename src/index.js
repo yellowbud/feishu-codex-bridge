@@ -14,12 +14,14 @@ const ROOT = path.resolve(__dirname, '..');
 const LOG_DIR = path.join(ROOT, 'logs');
 const DATA_DIR = path.join(ROOT, 'data');
 const CONVERSATION_DIR = path.join(DATA_DIR, 'conversations');
+const ATTACHMENT_DIR = path.join(DATA_DIR, 'attachments');
 const ACCESS_FILE = path.join(DATA_DIR, 'access.json');
 const WORKSPACE_FILE = path.join(DATA_DIR, 'workspaces.json');
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const APPROVED_DIR = path.join(DATA_DIR, 'approved');
 fs.mkdirSync(LOG_DIR, { recursive: true });
 fs.mkdirSync(CONVERSATION_DIR, { recursive: true });
+fs.mkdirSync(ATTACHMENT_DIR, { recursive: true, mode: 0o700 });
 
 const config = {
   appId: requireEnv('FEISHU_APP_ID'),
@@ -112,11 +114,13 @@ async function handleIncomingMessage(data) {
   const messageType = message.message_type;
   const chatType = message.chat_type;
   const text = extractText(message);
+  const attachments = extractAttachments(message);
   const mentions = Array.isArray(message.mentions) ? message.mentions : [];
   const senderId = data.sender && data.sender.sender_id && (data.sender.sender_id.open_id || data.sender.sender_id.user_id);
 
-  if (!chatId || !messageId || !text || !senderId) return;
-  log(`message received chat=${chatId} type=${chatType || 'unknown'} sender=${senderId} mentions=${mentions.length} text=${singleLine(text).slice(0, 120)}`);
+  if (!chatId || !messageId || !senderId) return;
+  if (!text && !attachments.length) return;
+  log(`message received chat=${chatId} type=${chatType || 'unknown'} messageType=${messageType || 'unknown'} sender=${senderId} mentions=${mentions.length} attachments=${attachments.length} text=${singleLine(text).slice(0, 120)}`);
   if (config.allowedChatIds.length && !config.allowedChatIds.includes(chatId)) {
     log(`ignored message from unauthorized chat ${chatId}`);
     return;
@@ -142,13 +146,25 @@ async function handleIncomingMessage(data) {
     return;
   }
 
+  if (attachments.length) {
+    await handleAttachmentMessage({
+      chatId,
+      messageId,
+      senderId,
+      text,
+      message,
+      attachments,
+    });
+    return;
+  }
+
   if (messageType !== 'text') {
     await sendUiMessage(chatId, {
       kind: 'error',
       title: '不支持的消息类型',
       template: 'red',
       summary: `当前消息类型：${messageType || 'unknown'}`,
-      body: '目前仅支持文本指令。',
+      body: '目前支持文本、图片和文件消息。',
     }, messageId);
     return;
   }
@@ -156,6 +172,76 @@ async function handleIncomingMessage(data) {
   const command = parseCommand(text);
   if (!command) return;
 
+  if (command.kind === 'run') {
+    await startCodexTask(command.prompt, {
+      chatId,
+      messageId,
+      senderId,
+      useMemory: command.useMemory,
+      memoryReason: command.memoryReason,
+      resetSession: command.resetSession,
+    });
+    return;
+  }
+  await runCommand(command, chatId, messageId);
+}
+
+async function handleAttachmentMessage(input) {
+  let files;
+  try {
+    files = await downloadMessageAttachments(input.message, input.attachments);
+  } catch (err) {
+    await sendUiMessage(input.chatId, {
+      kind: 'error',
+      title: '附件下载失败',
+      template: 'red',
+      summary: formatApiError(err),
+      body: '请确认飞书应用已开通“获取消息中的资源文件”权限，并重新发布自建应用版本。',
+    }, input.messageId);
+    log(`attachment download failed chat=${input.chatId} message=${input.messageId}: ${err.stack || err.message || err}`);
+    return;
+  }
+
+  if (!files.length) {
+    await sendUiMessage(input.chatId, {
+      kind: 'warn',
+      title: '没有可读取的附件',
+      template: 'orange',
+      summary: '这条消息里没有找到图片或文件资源。',
+    }, input.messageId);
+    return;
+  }
+
+  const rawText = stripMention(input.text || '').trim();
+  const parsed = rawText ? parseCommand(rawText) : null;
+  if (parsed && parsed.kind !== 'run') {
+    await runCommand(parsed, input.chatId, input.messageId);
+    return;
+  }
+
+  const fallback = '请读取我刚发送的附件，并根据附件内容直接回复。';
+  const promptText = parsed && parsed.kind === 'run'
+    ? parsed.prompt
+    : rawText || fallback;
+  const prompt = buildAttachmentPrompt(promptText, files);
+  const memoryHint = rawText ? memoryHintForPrompt(promptText) : {
+    useMemory: false,
+    resetSession: false,
+    reason: 'attachment-new-task',
+  };
+
+  await startCodexTask(prompt, {
+    chatId: input.chatId,
+    messageId: input.messageId,
+    senderId: input.senderId,
+    useMemory: parsed && parsed.kind === 'run' ? parsed.useMemory : memoryHint.useMemory,
+    memoryReason: parsed && parsed.kind === 'run' ? parsed.memoryReason : memoryHint.reason,
+    resetSession: parsed && parsed.kind === 'run' ? parsed.resetSession : memoryHint.resetSession,
+  });
+}
+
+async function runCommand(command, chatId, messageId) {
+  if (!command) return;
   if (command.kind === 'help') {
     await sendHelp(chatId, messageId);
     return;
@@ -189,17 +275,6 @@ async function handleIncomingMessage(data) {
   }
   if (command.kind === 'cancel') {
     await cancelTask(command.taskId, chatId, messageId);
-    return;
-  }
-  if (command.kind === 'run') {
-    await startCodexTask(command.prompt, {
-      chatId,
-      messageId,
-      senderId,
-      useMemory: command.useMemory,
-      memoryReason: command.memoryReason,
-      resetSession: command.resetSession,
-    });
   }
 }
 
@@ -978,7 +1053,7 @@ async function sendHelp(chatId, replyToMessageId) {
     '`/cancel <taskId>` 按任务 ID 取消',
     '`/cd <目录>` 切换当前飞书会话的工作目录',
     '`/ws` 查看 workspace；`/ws add <name> <目录>` 添加；`/ws <name>` 切换',
-    '直接发送需求即可执行任务；已授权群聊无需 @机器人。',
+    '直接发送需求、图片或文件即可执行任务；已授权群聊无需 @机器人。',
   ];
   const workspace = workspaceForChat(chatId);
   await sendCard(chatId, {
@@ -989,7 +1064,7 @@ async function sendHelp(chatId, replyToMessageId) {
     elements: cardElements([
       { tag: 'markdown', content: commands.join('\n') },
       { tag: 'markdown', content: `**当前 workspace**：${workspace.name}\n**当前目录**：${workspace.cwd}\n**Codex session**：${sessionForChat(chatId) || '未创建'}` },
-      { tag: 'markdown', content: `**会话用法**\n每个飞书会话可以有多个 workspace，每个 workspace 保留自己的 Codex session。\n需要彻底开新任务时用 \`/new\`。切换目录 \`/cd\` 会更新当前 workspace 并开启新 session。` },
+      { tag: 'markdown', content: `**会话用法**\n每个飞书会话可以有多个 workspace，每个 workspace 保留自己的 Codex session。\n图片和文件会先下载到本机，再把路径交给 Codex 读取。\n需要彻底开新任务时用 \`/new\`。切换目录 \`/cd\` 会更新当前 workspace 并开启新 session。` },
     ]),
   }, helpText(chatId), replyToMessageId);
 }
@@ -1052,11 +1127,153 @@ async function sendWebhookText(text) {
 }
 
 function extractText(message) {
+  const parsed = parseMessageContent(message);
+  if (message.message_type === 'post') return extractPostText(parsed).trim();
+  return String(parsed.text || '').trim();
+}
+
+function parseMessageContent(message) {
   try {
     const parsed = JSON.parse(message.content || '{}');
-    return String(parsed.text || '').trim();
+    return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
-    return '';
+    return {};
+  }
+}
+
+function extractAttachments(message) {
+  const parsed = parseMessageContent(message);
+  const type = message.message_type;
+  if (type === 'image' && parsed.image_key) {
+    return [{
+      type: 'image',
+      fileKey: parsed.image_key,
+      fileName: safeAttachmentFileName(parsed.file_name || parsed.name || 'image.png', 'image.png'),
+    }];
+  }
+  if (type === 'file' && parsed.file_key) {
+    return [{
+      type: 'file',
+      fileKey: parsed.file_key,
+      fileName: safeAttachmentFileName(parsed.file_name || parsed.name || 'file', 'file'),
+    }];
+  }
+  if (type === 'post') return extractPostImages(parsed);
+  return [];
+}
+
+function extractPostText(value) {
+  const parts = [];
+  walkPostContent(value, (node) => {
+    if (typeof node.text === 'string') parts.push(node.text);
+    if (typeof node.un_escape_text === 'string') parts.push(node.un_escape_text);
+  });
+  return parts.join(' ').replace(/\s+/g, ' ');
+}
+
+function extractPostImages(value) {
+  const images = [];
+  walkPostContent(value, (node) => {
+    if (node.image_key) {
+      images.push({
+        type: 'image',
+        fileKey: node.image_key,
+        fileName: safeAttachmentFileName(node.file_name || node.name || `image-${images.length + 1}.png`, `image-${images.length + 1}.png`),
+      });
+    }
+  });
+  return images;
+}
+
+function walkPostContent(value, visit) {
+  if (!value) return;
+  if (Array.isArray(value)) {
+    for (const item of value) walkPostContent(item, visit);
+    return;
+  }
+  if (typeof value !== 'object') return;
+  visit(value);
+  if (Array.isArray(value.content)) walkPostContent(value.content, visit);
+  if (Array.isArray(value.children)) walkPostContent(value.children, visit);
+}
+
+async function downloadMessageAttachments(message, attachments) {
+  const messageId = message.message_id;
+  const chatToken = safeFileToken(message.chat_id);
+  const messageToken = safeFileToken(messageId);
+  const dir = path.join(ATTACHMENT_DIR, chatToken, messageToken);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+  const used = new Set();
+  const files = [];
+  for (const attachment of attachments) {
+    const fileName = uniqueFileName(attachment.fileName, used);
+    const filePath = path.join(dir, fileName);
+    await downloadMessageResource(messageId, attachment, filePath);
+    files.push({
+      ...attachment,
+      fileName,
+      path: filePath,
+      size: fileSize(filePath),
+    });
+  }
+  return files;
+}
+
+async function downloadMessageResource(messageId, attachment, filePath) {
+  const response = await client.im.messageResource.get({
+    path: {
+      message_id: messageId,
+      file_key: attachment.fileKey,
+    },
+    params: {
+      type: attachment.type,
+    },
+  });
+  await response.writeFile(filePath);
+}
+
+function buildAttachmentPrompt(userText, files) {
+  const lines = [
+    '用户通过飞书发送了附件。附件已经下载到这台机器的本机路径；请直接读取这些路径，不要向用户索要文件。',
+    '',
+    '用户要求：',
+    String(userText || '').trim() || '请读取附件并回复。',
+    '',
+    '本机附件路径：',
+  ];
+  files.forEach((file, index) => {
+    const size = file.size === null ? '' : `, size=${file.size} bytes`;
+    lines.push(`${index + 1}. ${file.type}: ${file.path} (name=${file.fileName}${size})`);
+  });
+  return lines.join('\n');
+}
+
+function safeAttachmentFileName(name, fallback) {
+  const cleaned = path.basename(String(name || fallback || 'attachment'))
+    .replace(/[/\\?%*:|"<>]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned.slice(0, 180) || fallback || 'attachment';
+}
+
+function uniqueFileName(fileName, used) {
+  const parsed = path.parse(fileName);
+  let candidate = fileName;
+  let index = 2;
+  while (used.has(candidate)) {
+    candidate = `${parsed.name || 'attachment'}-${index}${parsed.ext || ''}`;
+    index += 1;
+  }
+  used.add(candidate);
+  return candidate;
+}
+
+function fileSize(filePath) {
+  try {
+    return fs.statSync(filePath).size;
+  } catch {
+    return null;
   }
 }
 
@@ -1100,7 +1317,7 @@ function helpText(chatId) {
   return [
     'Feishu Codex Bridge 在线。',
     '',
-    '执行任务：直接发送需求',
+    '执行任务：直接发送需求、图片或文件',
     '查看状态：/status',
     '新任务：/new',
     '停止当前会话任务：/stop',
