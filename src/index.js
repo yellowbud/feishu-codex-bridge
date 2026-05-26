@@ -219,6 +219,10 @@ async function handleCardAction(data) {
     : normalizeRawCardAction(data);
   if (!evt) return;
   const value = evt.action && evt.action.value && typeof evt.action.value === 'object' ? evt.action.value : {};
+  if (value.kind === 'bridge_config') {
+    await handleConfigAction(evt, value);
+    return;
+  }
   if (value.kind !== 'codex_prompt' || !value.prompt) {
     log(`ignored card action message=${evt.messageId || 'unknown'} action=${JSON.stringify(value).slice(0, 500)}`);
     return;
@@ -241,6 +245,27 @@ async function handleCardAction(data) {
     useMemory: true,
     memoryReason: 'card-action',
     resetSession: false,
+  });
+}
+
+async function handleConfigAction(evt, value) {
+  const chatId = value.chatId || evt.chatId;
+  if (!chatId) return;
+  const operatorId = evt.operator && (evt.operator.openId || evt.operator.userId) || 'card-action';
+  const gateResult = gateAction({ chatId, senderId: operatorId, chatType: value.chatType || 'group' });
+  if (gateResult.action !== 'deliver') {
+    log(`config access drop chat=${chatId} sender=${operatorId}`);
+    return;
+  }
+  const action = String(value.action || '');
+  if (action === 'set') {
+    updateChatPreference(chatId, value.key, value.value);
+  } else if (action === 'max_delta') {
+    updateGlobalPreference('maxConcurrentTasks', clampInt(effectiveMaxConcurrentTasks() + Number(value.delta || 0), 1, 10));
+  }
+  await sendConfigForm(chatId, evt.messageId, {
+    title: '偏好设置已更新',
+    template: 'green',
   });
 }
 
@@ -455,6 +480,10 @@ async function runCommand(command, source) {
     await sendStatus(chatId, messageId, contextId, context && context.label);
     return;
   }
+  if (command.kind === 'config') {
+    await sendConfigForm(chatId, messageId, { isGroup: context && isGroupChat(context.chatType) });
+    return;
+  }
   if (command.kind === 'reset') {
     resetConversation(contextId);
     clearChatSession(contextId);
@@ -505,6 +534,7 @@ function parseCommand(rawText) {
 
   if (!body || (exactCommand && ['help', '帮助'].includes(commandLower))) return { kind: 'help' };
   if (exactCommand && ['status', '状态'].includes(commandLower)) return { kind: 'status' };
+  if (exactCommand && ['config', 'settings', '设置', '偏好设置'].includes(commandLower)) return { kind: 'config' };
   if (commandWithArgsAllowed && commandLower === 'new' && (commandArgs[0] || '').toLowerCase() === 'chat') {
     return { kind: 'newChat', topic: commandArgs.slice(1).join(' ').trim() };
   }
@@ -573,6 +603,8 @@ function readAccessFile() {
       allowFrom: Array.isArray(parsed.allowFrom) ? parsed.allowFrom : [],
       groups: parsed.groups && typeof parsed.groups === 'object' ? parsed.groups : {},
       pending: parsed.pending && typeof parsed.pending === 'object' ? parsed.pending : {},
+      preferences: parsed.preferences && typeof parsed.preferences === 'object' ? parsed.preferences : {},
+      chatPreferences: parsed.chatPreferences && typeof parsed.chatPreferences === 'object' ? parsed.chatPreferences : {},
       mentionPatterns: Array.isArray(parsed.mentionPatterns) ? parsed.mentionPatterns : undefined,
       textChunkLimit: Number.isFinite(parsed.textChunkLimit) ? parsed.textChunkLimit : undefined,
       chunkMode: ['length', 'newline'].includes(parsed.chunkMode) ? parsed.chunkMode : undefined,
@@ -803,6 +835,88 @@ async function sendWorkspaceStatus(chatId, replyToMessageId) {
   }, replyToMessageId);
 }
 
+async function sendConfigForm(chatId, replyToMessageId, options = {}) {
+  const prefs = effectiveChatPreferences(chatId);
+  const maxConcurrentTasks = effectiveMaxConcurrentTasks();
+  const isGroup = typeof options.isGroup === 'boolean' ? options.isGroup : Boolean(readAccessFile().groups[chatId]);
+  const requireMention = prefs.requireMention;
+  const summary = [
+    `**消息回复方式**：${prefs.replyMode === 'text' ? '纯文本' : '卡片'}`,
+    `**工具调用显示**：${prefs.showToolCalls ? '显示' : '隐藏'}`,
+    `**并发上限**：${maxConcurrentTasks}`,
+    `**群内 @ bot 才回复**：${requireMention ? '需要' : '不需要'}`,
+  ].join('\n');
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      template: options.template || 'blue',
+      title: { tag: 'plain_text', content: options.title || '偏好设置' },
+    },
+    elements: cardElements([
+      { tag: 'markdown', content: `${summary}\n\n点击下面按钮会立即生效。` },
+      {
+        tag: 'action',
+        layout: 'flow',
+        actions: [
+          configButton('卡片回复', chatId, isGroup, 'replyMode', 'card', prefs.replyMode === 'card'),
+          configButton('纯文本回复', chatId, isGroup, 'replyMode', 'text', prefs.replyMode === 'text'),
+        ],
+      },
+      {
+        tag: 'action',
+        layout: 'flow',
+        actions: [
+          configButton('显示工具调用', chatId, isGroup, 'showToolCalls', true, prefs.showToolCalls),
+          configButton('隐藏工具调用', chatId, isGroup, 'showToolCalls', false, !prefs.showToolCalls),
+        ],
+      },
+      {
+        tag: 'action',
+        layout: 'flow',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '并发 -1' },
+            type: 'default',
+            value: { kind: 'bridge_config', action: 'max_delta', chatId, chatType: isGroup ? 'group' : 'p2p', delta: -1 },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '并发 +1' },
+            type: 'primary',
+            value: { kind: 'bridge_config', action: 'max_delta', chatId, chatType: isGroup ? 'group' : 'p2p', delta: 1 },
+          },
+        ],
+      },
+      isGroup ? {
+        tag: 'action',
+        layout: 'flow',
+        actions: [
+          configButton('群内需要 @', chatId, isGroup, 'requireMention', true, requireMention),
+          configButton('群内直接回复', chatId, isGroup, 'requireMention', false, !requireMention),
+        ],
+      } : { tag: 'markdown', content: '当前是私聊，群内 @ 设置只在群聊里显示并生效。' },
+    ]),
+  };
+  await sendCard(chatId, card, `偏好设置\n${summary}`, replyToMessageId, { forceCard: true });
+}
+
+function configButton(label, chatId, isGroup, key, value, selected) {
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: selected ? `✓ ${label}` : label },
+    type: selected ? 'primary' : 'default',
+    value: {
+      kind: 'bridge_config',
+      action: 'set',
+      chatId,
+      chatType: isGroup ? 'group' : 'p2p',
+      key,
+      value,
+    },
+  };
+}
+
 async function handleCd(chatId, target, replyToMessageId, contextId = chatId) {
   const resolved = resolveWorkspacePath(target, cwdForChat(chatId));
   if (!resolved.ok) {
@@ -857,6 +971,72 @@ function saveAccess(access) {
   const tmp = `${ACCESS_FILE}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(access, null, 2)}\n`, { mode: 0o600 });
   fs.renameSync(tmp, ACCESS_FILE);
+}
+
+function effectiveChatPreferences(chatId) {
+  const access = config.accessEnabled ? readAccessFile() : {};
+  const chatPrefs = access.chatPreferences && access.chatPreferences[chatId] && typeof access.chatPreferences[chatId] === 'object'
+    ? access.chatPreferences[chatId]
+    : {};
+  const groupPolicy = access.groups && access.groups[chatId] && typeof access.groups[chatId] === 'object'
+    ? access.groups[chatId]
+    : {};
+  return {
+    replyMode: chatPrefs.replyMode === 'text' ? 'text' : 'card',
+    showToolCalls: typeof chatPrefs.showToolCalls === 'boolean' ? chatPrefs.showToolCalls : config.streamOutput,
+    requireMention: typeof groupPolicy.requireMention === 'boolean' ? groupPolicy.requireMention : true,
+  };
+}
+
+function updateChatPreference(chatId, key, value) {
+  if (!config.accessEnabled || !chatId) return;
+  const access = readAccessFile();
+  if (key === 'requireMention') {
+    access.groups = access.groups && typeof access.groups === 'object' ? access.groups : {};
+    const existing = access.groups[chatId] && typeof access.groups[chatId] === 'object' ? access.groups[chatId] : {};
+    access.groups[chatId] = {
+      ...existing,
+      requireMention: Boolean(value),
+    };
+  } else if (key === 'replyMode' || key === 'showToolCalls') {
+    access.chatPreferences = access.chatPreferences && typeof access.chatPreferences === 'object' ? access.chatPreferences : {};
+    const existing = access.chatPreferences[chatId] && typeof access.chatPreferences[chatId] === 'object' ? access.chatPreferences[chatId] : {};
+    access.chatPreferences[chatId] = {
+      ...existing,
+      [key]: key === 'replyMode' && value === 'text' ? 'text' : (key === 'replyMode' ? 'card' : Boolean(value)),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  saveAccess(access);
+}
+
+function updateGlobalPreference(key, value) {
+  if (!config.accessEnabled) return;
+  const access = readAccessFile();
+  access.preferences = access.preferences && typeof access.preferences === 'object' ? access.preferences : {};
+  access.preferences[key] = value;
+  access.preferences.updatedAt = new Date().toISOString();
+  saveAccess(access);
+}
+
+function effectiveMaxConcurrentTasks() {
+  const access = config.accessEnabled ? readAccessFile() : {};
+  const value = access.preferences && Number(access.preferences.maxConcurrentTasks);
+  return clampInt(Number.isFinite(value) ? value : config.maxConcurrentTasks, 1, 10);
+}
+
+function shouldShowToolCalls(chatId) {
+  return effectiveChatPreferences(chatId).showToolCalls;
+}
+
+function prefersPlainReplies(chatId) {
+  return effectiveChatPreferences(chatId).replyMode === 'text';
+}
+
+function clampInt(value, min, max) {
+  const number = Number.parseInt(value, 10);
+  if (!Number.isFinite(number)) return min;
+  return Math.max(min, Math.min(max, number));
 }
 
 function gateMessage(input) {
@@ -978,14 +1158,15 @@ function checkApprovals() {
 }
 
 async function startCodexTask(prompt, source) {
-  if (running.size >= config.maxConcurrentTasks) {
+  const maxConcurrentTasks = effectiveMaxConcurrentTasks();
+  if (running.size >= maxConcurrentTasks) {
     await sendUiMessage(
       source.chatId,
       {
         kind: 'busy',
         title: '任务队列已满',
         template: 'orange',
-        summary: `当前已有 ${running.size} 个任务运行中。`,
+        summary: `当前已有 ${running.size} 个任务运行中，上限 ${maxConcurrentTasks}。`,
         body: `查看状态：\`${config.commandPrefix} status\`\n取消任务：\`${config.commandPrefix} cancel <taskId>\``,
       },
       source.messageId,
@@ -1057,6 +1238,7 @@ async function startCodexTask(prompt, source) {
     jsonRemainder: '',
     timer: null,
     killedByUser: false,
+    showToolCalls: shouldShowToolCalls(source.chatId),
   };
   running.set(taskId, task);
 
@@ -1186,7 +1368,7 @@ async function flushTaskBuffer(task) {
 
   const buffered = task.buffer;
   task.buffer = '';
-  if (!buffered.trim() || !config.streamOutput) return;
+  if (!buffered.trim() || !task.showToolCalls) return;
 
   const chunks = chunkText(buffered, 3500);
   for (const chunk of chunks) {
@@ -1588,6 +1770,9 @@ async function sendStatus(chatId, replyToMessageId, contextId = chatId, contextL
   fields.push(`**当前 thread Codex session**：${sessionForChat(contextId, workspace.name) || '未创建'}`);
   fields.push(`**默认工作目录**：${config.codexCwd}`);
   fields.push(`**上下文记忆**：${memoryStatusText()}`);
+  fields.push(`**并发上限**：${effectiveMaxConcurrentTasks()}`);
+  fields.push(`**回复方式**：${prefersPlainReplies(chatId) ? '纯文本' : '卡片'}`);
+  fields.push(`**工具调用显示**：${shouldShowToolCalls(chatId) ? '显示' : '隐藏'}`);
   await sendCard(chatId, {
     header: {
       template: running.size ? 'orange' : 'green',
@@ -1601,6 +1786,7 @@ async function sendHelp(chatId, replyToMessageId) {
   const commands = [
     '`/help` 查看帮助',
     '`/status` 查看状态',
+    '`/config` 打开偏好设置',
     '`/new` 开始新任务并清空当前会话上下文',
     '`/new chat <名字>` 自动创建一个新 project 群',
     '`/stop` 停止当前飞书会话的运行中任务',
@@ -1624,7 +1810,11 @@ async function sendHelp(chatId, replyToMessageId) {
   }, helpText(chatId), replyToMessageId);
 }
 
-async function sendCard(chatId, card, fallbackText, replyToMessageId) {
+async function sendCard(chatId, card, fallbackText, replyToMessageId, options = {}) {
+  if (!options.forceCard && prefersPlainReplies(chatId)) {
+    await sendText(chatId, fallbackText, replyToMessageId);
+    return;
+  }
   try {
     if (replyToMessageId) {
       await client.im.message.reply({
@@ -1778,6 +1968,7 @@ function messageContext(message) {
   if (!isGroupChat(chatType)) {
     return {
       chatId,
+      chatType,
       threadId: '',
       contextId: chatId,
       label: '私聊',
@@ -1787,6 +1978,7 @@ function messageContext(message) {
   const threadId = message.thread_id || message.root_id || message.message_id;
   return {
     chatId,
+    chatType,
     threadId,
     contextId: `${chatId}::thread:${threadId}`,
     label: message.thread_id || message.root_id ? `thread ${threadId}` : `new thread ${threadId}`,
@@ -1953,7 +2145,8 @@ function stripMention(text) {
 
 function statusText(chatId, contextId = chatId, contextLabel = '') {
   const workspace = workspaceForChat(chatId);
-  if (!running.size) return `当前没有运行中的 Codex 任务。桥接服务在线。\n${contextLabel ? `当前 session scope：${contextLabel}\n` : ''}当前 workspace：${workspace.name}\n当前会话工作目录：${workspace.cwd}\n当前 thread Codex session：${sessionForChat(contextId, workspace.name) || '未创建'}\n${conversationStatusText()}`;
+  const preferences = `并发上限：${effectiveMaxConcurrentTasks()}\n回复方式：${prefersPlainReplies(chatId) ? '纯文本' : '卡片'}\n工具调用显示：${shouldShowToolCalls(chatId) ? '显示' : '隐藏'}`;
+  if (!running.size) return `当前没有运行中的 Codex 任务。桥接服务在线。\n${contextLabel ? `当前 session scope：${contextLabel}\n` : ''}当前 workspace：${workspace.name}\n当前会话工作目录：${workspace.cwd}\n当前 thread Codex session：${sessionForChat(contextId, workspace.name) || '未创建'}\n${conversationStatusText()}\n${preferences}`;
   const lines = ['运行中的任务：'];
   for (const task of running.values()) {
     lines.push(`- ${task.id}，workspace=${task.workspaceName || 'default'}，已运行 ${Math.round((Date.now() - task.startedAt) / 1000)}s`);
@@ -1963,6 +2156,7 @@ function statusText(chatId, contextId = chatId, contextLabel = '') {
   if (contextLabel) lines.push(`当前 session scope：${contextLabel}`);
   lines.push(`当前 thread Codex session：${sessionForChat(contextId, workspace.name) || '未创建'}`);
   lines.push(conversationStatusText());
+  lines.push(preferences);
   return lines.join('\n');
 }
 
@@ -1987,6 +2181,7 @@ function helpText(chatId) {
     '',
     '执行任务：直接发送需求、图片或文件',
     '查看状态：/status',
+    '偏好设置：/config',
     '新任务：/new',
     '新建 project 群：/new chat <名字>',
     '停止当前会话任务：/stop',
